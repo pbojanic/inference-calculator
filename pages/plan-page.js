@@ -1,0 +1,623 @@
+// ---------------------------------------------------------------------------
+// Plan page: capacity planning for inference workloads
+// Calculates KV cache storage size and IO throughput (GiB/s)
+// ---------------------------------------------------------------------------
+
+const LS_PLAN_KEY = 'gpu_calc_plan';
+
+function _getPlanStore() {
+    const raw = localStorage.getItem(LS_PLAN_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw);
+}
+
+function _savePlanStore(store) {
+    localStorage.setItem(LS_PLAN_KEY, JSON.stringify(store));
+}
+
+function defaultPlanEntry(workspaceId) {
+    return {
+        workspaceId,
+        serverInstances: 1,
+        totalUsers: 100,
+        concurrentUsers: 10,
+        exchangesPerUser: 50,
+        exchangeRatePerHour: 10,
+        distribution: [
+            { contextSize: 500, percentage: 100, cacheHitRate: 0 }
+        ]
+    };
+}
+
+// Sync plan store with current workspace: remove orphans, add defaults for new models
+function syncPlanWithWorkspace() {
+    const workspaceModels = getWorkspaceModels();
+    const wsIds = new Set(workspaceModels.map(m => m.id));
+    const store = _getPlanStore();
+
+    // Remove orphaned entries
+    for (const id of Object.keys(store)) {
+        if (!wsIds.has(id)) delete store[id];
+    }
+
+    // Add defaults for new models
+    for (const model of workspaceModels) {
+        if (!store[model.id]) {
+            store[model.id] = defaultPlanEntry(model.id);
+        }
+    }
+
+    _savePlanStore(store);
+    return store;
+}
+
+// Get the max allowed context size for a workspace entry
+// Bounded by the user's configured sequence length, not by sliding window
+// (sliding window caps KV cache size per layer, not the sequence length)
+function getMaxContextForEntry(entry) {
+    const dep = entry.deployment;
+    return (dep && dep.seqLen) || entry.config.max_position_embeddings || 131072;
+}
+
+// Validate a plan entry against its workspace entry. Returns array of error strings.
+function validatePlanEntry(plan, maxContext) {
+    const errors = [];
+
+    if (!Number.isInteger(plan.serverInstances) || plan.serverInstances < 1)
+        errors.push('Server instances must be at least 1');
+    if (!Number.isInteger(plan.totalUsers) || plan.totalUsers < 1)
+        errors.push('Total users must be at least 1');
+    if (!Number.isInteger(plan.concurrentUsers) || plan.concurrentUsers < 1)
+        errors.push('Concurrent users must be at least 1');
+    if (plan.concurrentUsers > plan.totalUsers)
+        errors.push('Concurrent users cannot exceed total users');
+    if (!Number.isInteger(plan.exchangesPerUser) || plan.exchangesPerUser < 1)
+        errors.push('Exchanges per user must be at least 1');
+    if (typeof plan.exchangeRatePerHour !== 'number' || plan.exchangeRatePerHour <= 0)
+        errors.push('Exchange rate must be greater than 0');
+
+    const pctSum = plan.distribution.reduce((s, b) => s + b.percentage, 0);
+    if (Math.abs(pctSum - 100) > 0.01)
+        errors.push(`Distribution must sum to 100% (currently ${pctSum.toFixed(1)}%)`);
+
+    const seenSizes = new Set();
+    for (const bucket of plan.distribution) {
+        if (!Number.isInteger(bucket.contextSize) || bucket.contextSize < 1)
+            errors.push(`Context size must be a positive integer`);
+        if (bucket.contextSize > maxContext)
+            errors.push(`Context size ${bucket.contextSize.toLocaleString()} exceeds max ${maxContext.toLocaleString()}`);
+        if (seenSizes.has(bucket.contextSize))
+            errors.push(`Duplicate context size: ${bucket.contextSize.toLocaleString()}`);
+        seenSizes.add(bucket.contextSize);
+        if (bucket.percentage < 0 || bucket.percentage > 100)
+            errors.push(`Percentage must be 0–100`);
+        if (bucket.cacheHitRate < 0 || bucket.cacheHitRate > 100)
+            errors.push(`Cache hit rate must be 0–100`);
+    }
+
+    return errors;
+}
+
+
+// ---------------------------------------------------------------------------
+// Page renderer
+// ---------------------------------------------------------------------------
+function renderPlanPage(container) {
+    let planData = {};       // working copy (unsaved)
+    let savedData = {};      // last saved snapshot
+    let debounceTimer = null;
+
+    // Stable DOM references for live-updating outputs (no full re-render needed)
+    // Keyed by workspace model ID
+    const cardOutputs = {};  // { wsId: { resultsDiv, errorsDiv, detailsDiv, pctSumCell, kvCells[], ctxInputs[] } }
+    let rollupPanel = null;
+    let rollupDetailsDiv = null;
+    let showDetailsCheckbox = null;
+    let saveBtnRef = null;
+
+    function loadData() {
+        savedData = syncPlanWithWorkspace();
+        planData = JSON.parse(JSON.stringify(savedData));
+    }
+
+    function markDirty() {
+        State.setDirty(true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full render — only called on initial load, add/remove bucket, cancel
+    // -----------------------------------------------------------------------
+    function render() {
+        container.innerHTML = '';
+        Object.keys(cardOutputs).forEach(k => delete cardOutputs[k]);
+        rollupPanel = null;
+        rollupDetailsDiv = null;
+        saveBtnRef = null;
+
+        const workspaceModels = getWorkspaceModels();
+
+        // Empty state
+        if (workspaceModels.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'empty-state';
+            empty.innerHTML = 'No models in workspace. <a href="#home" style="color: var(--accent);">Add models</a> to start planning.';
+            container.appendChild(empty);
+            return;
+        }
+
+        const title = document.createElement('h2');
+        title.style.cssText = 'margin: 0 0 12px; border: none; padding: 0;';
+        title.textContent = 'Capacity Plan';
+        container.appendChild(title);
+
+        for (const wsEntry of workspaceModels) {
+            const plan = planData[wsEntry.id];
+            if (!plan) continue;
+            container.appendChild(buildModelCard(wsEntry, plan));
+        }
+
+        // Show details toggle
+        const toggleRow = document.createElement('div');
+        toggleRow.className = 'toggle-row';
+        toggleRow.style.marginTop = '12px';
+        showDetailsCheckbox = document.createElement('input');
+        showDetailsCheckbox.type = 'checkbox';
+        showDetailsCheckbox.id = 'plan-show-details';
+        const toggleLabel = document.createElement('label');
+        toggleLabel.htmlFor = 'plan-show-details';
+        toggleLabel.textContent = 'Show calculation details';
+        showDetailsCheckbox.onchange = () => updateOutputs();
+        toggleRow.appendChild(showDetailsCheckbox);
+        toggleRow.appendChild(toggleLabel);
+        container.appendChild(toggleRow);
+
+        // Roll-up placeholder
+        rollupPanel = document.createElement('div');
+        rollupPanel.className = 'panel plan-rollup';
+        container.appendChild(rollupPanel);
+
+        // Roll-up details placeholder
+        rollupDetailsDiv = document.createElement('div');
+        rollupDetailsDiv.className = 'plan-details';
+        rollupPanel.appendChild(rollupDetailsDiv);
+
+        // Save / Cancel buttons
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        actions.style.marginTop = '16px';
+
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'btn-primary';
+        saveBtn.textContent = 'Save';
+        saveBtn.onclick = () => {
+            _savePlanStore(planData);
+            savedData = JSON.parse(JSON.stringify(planData));
+            State.setDirty(false);
+        };
+        saveBtnRef = saveBtn;
+        actions.appendChild(saveBtn);
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn-secondary';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.onclick = () => {
+            planData = JSON.parse(JSON.stringify(savedData));
+            State.setDirty(false);
+            render();
+        };
+        actions.appendChild(cancelBtn);
+
+        container.appendChild(actions);
+
+        // Initial calculation update
+        updateOutputs();
+    }
+
+    // -----------------------------------------------------------------------
+    // Lightweight output update — updates results, errors, KV cells, rollup
+    // without touching inputs or rebuilding the DOM
+    // -----------------------------------------------------------------------
+    function updateOutputs() {
+        const showDetails = showDetailsCheckbox ? showDetailsCheckbox.checked : false;
+        const workspaceModels = getWorkspaceModels();
+        const allResults = [];
+        let hasErrors = false;
+
+        for (const wsEntry of workspaceModels) {
+            const plan = planData[wsEntry.id];
+            const refs = cardOutputs[wsEntry.id];
+            if (!plan || !refs) continue;
+
+            const maxCtx = getMaxContextForEntry(wsEntry);
+            const errors = validatePlanEntry(plan, maxCtx);
+            if (errors.length > 0) hasErrors = true;
+
+            // Update errors div
+            refs.errorsDiv.innerHTML = errors.map(e => `<div class="status-err">${e}</div>`).join('');
+
+            // Update percentage sum
+            const pctSum = plan.distribution.reduce((s, b) => s + b.percentage, 0);
+            const sumOk = Math.abs(pctSum - 100) < 0.01;
+            refs.pctSumCell.className = sumOk ? 'status-ok' : 'status-err';
+            refs.pctSumCell.style.fontSize = '0.8rem';
+            refs.pctSumCell.style.fontWeight = '600';
+            refs.pctSumCell.textContent = `Sum: ${pctSum.toFixed(1)}%${sumOk ? '' : ' (must be 100%)'}`;
+
+            // Update KV cache per sequence cells
+            const bytesPerKV = (wsEntry.deployment && wsEntry.deployment.bytesPerKV) || 2;
+            for (let i = 0; i < plan.distribution.length; i++) {
+                const cell = refs.kvCells[i];
+                if (!cell) continue;
+                try {
+                    const kvBytes = kvCacheBytesForContext(wsEntry.config, plan.distribution[i].contextSize, bytesPerKV);
+                    cell.textContent = formatSizeHuman(kvBytes);
+                } catch (e) {
+                    cell.textContent = '—';
+                }
+            }
+
+            // Update context size input borders
+            for (let i = 0; i < plan.distribution.length; i++) {
+                const input = refs.ctxInputs[i];
+                if (!input) continue;
+                input.style.borderColor = plan.distribution[i].contextSize > maxCtx ? '#F04E23' : '';
+            }
+
+            // Calculate and update results
+            let result = null;
+            try {
+                result = calculatePlanEntry(plan, wsEntry);
+            } catch (e) { /* invalid inputs */ }
+
+            if (result) {
+                allResults.push({ result, wsEntry });
+                refs.resultsDiv.innerHTML = `
+                    <div class="plan-result-row">
+                        <span class="plan-result-label">KV Cache Size:</span>
+                        <span class="plan-result-value">${formatSizeHuman(result.totalKVSizeBytes)}</span>
+                    </div>
+                    <div class="plan-result-row">
+                        <span class="plan-result-label">Write Throughput:</span>
+                        <span class="plan-result-value">${formatThroughputHuman(result.totalWriteGiBps)}</span>
+                    </div>
+                    <div class="plan-result-row">
+                        <span class="plan-result-label">Read Throughput:</span>
+                        <span class="plan-result-value">${formatThroughputHuman(result.totalReadGiBps)}</span>
+                    </div>
+                `;
+                refs.detailsDiv.innerHTML = showDetails ? buildDetailHTML(result, wsEntry) : '';
+            } else {
+                refs.resultsDiv.innerHTML = '';
+                refs.detailsDiv.innerHTML = '';
+            }
+        }
+
+        // Update roll-up
+        if (rollupPanel) {
+            const results = allResults.map(r => r.result);
+            if (results.length > 0) {
+                const rollup = calculatePlanRollup(results);
+                let rollupHTML = `
+                    <h2 style="margin-top: 0;">Aggregate</h2>
+                    <div class="plan-result-row">
+                        <span class="plan-result-label">Total KV Cache Size:</span>
+                        <span class="plan-result-value">${formatSizeHuman(rollup.totalKVSizeBytes)}</span>
+                    </div>
+                    <div class="plan-result-row">
+                        <span class="plan-result-label">Total Write Throughput:</span>
+                        <span class="plan-result-value">${formatThroughputHuman(rollup.totalWriteGiBps)}</span>
+                    </div>
+                    <div class="plan-result-row">
+                        <span class="plan-result-label">Total Read Throughput:</span>
+                        <span class="plan-result-value">${formatThroughputHuman(rollup.totalReadGiBps)}</span>
+                    </div>
+                `;
+                if (showDetails) {
+                    rollupHTML += '<div class="plan-details">' + buildRollupDetailHTML(allResults) + '</div>';
+                }
+                rollupPanel.innerHTML = rollupHTML;
+                rollupPanel.style.display = '';
+            } else {
+                rollupPanel.style.display = 'none';
+            }
+        }
+
+        // Update save button state
+        if (saveBtnRef) {
+            saveBtnRef.disabled = hasErrors;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Model card — builds the full card with stable output references
+    // -----------------------------------------------------------------------
+    function buildModelCard(wsEntry, plan) {
+        const maxCtx = getMaxContextForEntry(wsEntry);
+
+        const card = document.createElement('div');
+        card.className = 'panel plan-card';
+
+        // Header
+        const header = document.createElement('div');
+        header.className = 'plan-card-header';
+        const titleSpan = document.createElement('span');
+        titleSpan.className = 'plan-card-title';
+        titleSpan.textContent = wsEntry.title;
+        header.appendChild(titleSpan);
+        if (wsEntry.title !== wsEntry.baseModel) {
+            const base = document.createElement('span');
+            base.className = 'plan-card-base';
+            base.textContent = wsEntry.baseModel;
+            header.appendChild(base);
+        }
+        card.appendChild(header);
+
+        // Input fields row
+        const inputRow = document.createElement('div');
+        inputRow.className = 'plan-inputs-row';
+
+        inputRow.appendChild(buildNumberField('Server instances', plan.serverInstances, 1, null, true, v => {
+            plan.serverInstances = v; markDirty(); scheduleRecalc();
+        }));
+        inputRow.appendChild(buildNumberField('Total users', plan.totalUsers, 1, null, true, v => {
+            plan.totalUsers = v; markDirty(); scheduleRecalc();
+        }));
+        inputRow.appendChild(buildNumberField('Concurrent users', plan.concurrentUsers, 1, null, true, v => {
+            plan.concurrentUsers = v; markDirty(); scheduleRecalc();
+        }));
+        inputRow.appendChild(buildNumberField('Exchanges/user', plan.exchangesPerUser, 1, null, true, v => {
+            plan.exchangesPerUser = v; markDirty(); scheduleRecalc();
+        }));
+        inputRow.appendChild(buildNumberField('Rate/hr/user', plan.exchangeRatePerHour, 0.1, null, false, v => {
+            plan.exchangeRatePerHour = v; markDirty(); scheduleRecalc();
+        }));
+
+        card.appendChild(inputRow);
+
+        // Distribution table
+        const distSection = document.createElement('div');
+        distSection.style.marginTop = '12px';
+
+        const distHeader = document.createElement('h3');
+        distHeader.textContent = 'Input Token Distribution';
+        distHeader.style.marginBottom = '6px';
+        distSection.appendChild(distHeader);
+
+        const table = document.createElement('table');
+        table.className = 'distribution-table';
+
+        const thead = document.createElement('thead');
+        thead.innerHTML = `<tr>
+            <th>Context Size</th>
+            <th>% of Exchanges</th>
+            <th>Cache Hit Rate %</th>
+            <th>KV Cache/seq</th>
+            <th></th>
+        </tr>`;
+        table.appendChild(thead);
+
+        // Track output cells per row
+        const kvCells = [];
+        const ctxInputs = [];
+
+        const tbody = document.createElement('tbody');
+        for (let i = 0; i < plan.distribution.length; i++) {
+            const { tr, kvCell, ctxInput } = buildDistRow(plan, i, maxCtx, wsEntry);
+            tbody.appendChild(tr);
+            kvCells.push(kvCell);
+            ctxInputs.push(ctxInput);
+        }
+        table.appendChild(tbody);
+
+        // Footer: percentage sum (stable reference)
+        const tfoot = document.createElement('tfoot');
+        const sumRow = document.createElement('tr');
+        const emptyTd = document.createElement('td');
+        const pctSumCell = document.createElement('td');
+        const restTd = document.createElement('td');
+        restTd.colSpan = 3;
+        sumRow.appendChild(emptyTd);
+        sumRow.appendChild(pctSumCell);
+        sumRow.appendChild(restTd);
+        tfoot.appendChild(sumRow);
+        table.appendChild(tfoot);
+
+        distSection.appendChild(table);
+
+        // Add bucket button
+        const addBucketBtn = document.createElement('button');
+        addBucketBtn.className = 'btn-secondary btn-small';
+        addBucketBtn.textContent = 'Add Bucket';
+        addBucketBtn.style.marginTop = '6px';
+        addBucketBtn.onclick = () => {
+            plan.distribution.push({ contextSize: 1000, percentage: 0, cacheHitRate: 0 });
+            markDirty();
+            render(); // full re-render needed for structural change
+        };
+        distSection.appendChild(addBucketBtn);
+
+        card.appendChild(distSection);
+
+        // Errors placeholder (stable reference)
+        const errorsDiv = document.createElement('div');
+        errorsDiv.style.marginTop = '8px';
+        card.appendChild(errorsDiv);
+
+        // Results placeholder (stable reference)
+        const resultsDiv = document.createElement('div');
+        resultsDiv.className = 'plan-results';
+        card.appendChild(resultsDiv);
+
+        // Calculation details placeholder (stable reference, shown via toggle)
+        const detailsDiv = document.createElement('div');
+        detailsDiv.className = 'plan-details';
+        card.appendChild(detailsDiv);
+
+        // Store stable output references
+        cardOutputs[wsEntry.id] = { resultsDiv, errorsDiv, detailsDiv, pctSumCell, kvCells, ctxInputs };
+
+        return card;
+    }
+
+    // -----------------------------------------------------------------------
+    // Distribution row — returns { tr, kvCell, ctxInput } for output tracking
+    // -----------------------------------------------------------------------
+    function buildDistRow(plan, idx, maxCtx, wsEntry) {
+        const bucket = plan.distribution[idx];
+        const tr = document.createElement('tr');
+
+        // Context size
+        const tdCtx = document.createElement('td');
+        const ctxInput = document.createElement('input');
+        ctxInput.type = 'number';
+        ctxInput.value = bucket.contextSize;
+        ctxInput.min = 1;
+        ctxInput.max = maxCtx;
+        ctxInput.step = 1;
+        ctxInput.oninput = () => {
+            bucket.contextSize = parseInt(ctxInput.value) || 0;
+            markDirty(); scheduleRecalc();
+        };
+        tdCtx.appendChild(ctxInput);
+        tr.appendChild(tdCtx);
+
+        // Percentage
+        const tdPct = document.createElement('td');
+        const pctInput = document.createElement('input');
+        pctInput.type = 'number';
+        pctInput.value = bucket.percentage;
+        pctInput.min = 0;
+        pctInput.max = 100;
+        pctInput.step = 0.1;
+        pctInput.oninput = () => {
+            bucket.percentage = parseFloat(pctInput.value) || 0;
+            markDirty(); scheduleRecalc();
+        };
+        tdPct.appendChild(pctInput);
+        tr.appendChild(tdPct);
+
+        // Cache hit rate
+        const tdHit = document.createElement('td');
+        const hitInput = document.createElement('input');
+        hitInput.type = 'number';
+        hitInput.value = bucket.cacheHitRate;
+        hitInput.min = 0;
+        hitInput.max = 100;
+        hitInput.step = 1;
+        hitInput.oninput = () => {
+            bucket.cacheHitRate = parseFloat(hitInput.value) || 0;
+            markDirty(); scheduleRecalc();
+        };
+        tdHit.appendChild(hitInput);
+        tr.appendChild(tdHit);
+
+        // KV cache per sequence (read-only output cell)
+        const kvCell = document.createElement('td');
+        kvCell.style.fontSize = '0.8rem';
+        kvCell.style.color = 'var(--text-muted)';
+        tr.appendChild(kvCell);
+
+        // Remove button
+        const tdRm = document.createElement('td');
+        const rmBtn = document.createElement('button');
+        rmBtn.className = 'btn-danger btn-small';
+        rmBtn.textContent = '×';
+        rmBtn.disabled = plan.distribution.length <= 1;
+        rmBtn.onclick = () => {
+            plan.distribution.splice(idx, 1);
+            markDirty();
+            render(); // full re-render for structural change
+        };
+        tdRm.appendChild(rmBtn);
+        tr.appendChild(tdRm);
+
+        return { tr, kvCell, ctxInput };
+    }
+
+    // -----------------------------------------------------------------------
+    // Number input field builder
+    // -----------------------------------------------------------------------
+    function buildNumberField(labelText, value, min, max, isInt, onChange) {
+        const wrapper = document.createElement('label');
+        wrapper.textContent = labelText;
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.value = value;
+        if (min !== null) input.min = min;
+        if (max !== null) input.max = max;
+        input.step = isInt ? 1 : 0.1;
+        input.oninput = () => {
+            const v = isInt ? parseInt(input.value) : parseFloat(input.value);
+            if (!isNaN(v)) onChange(v);
+        };
+        wrapper.appendChild(input);
+        return wrapper;
+    }
+
+    // -----------------------------------------------------------------------
+    // Detail breakdown HTML for a single model
+    // -----------------------------------------------------------------------
+    function buildDetailHTML(result, wsEntry) {
+        const lines = [];
+
+        lines.push('<h3 style="margin-top: 10px;">Calculation Details</h3>');
+
+        // KV Cache Size breakdown
+        lines.push('<div class="plan-detail-section">');
+        lines.push('<strong>KV Cache Size</strong>');
+        lines.push(`<div class="plan-detail-formula">${result.totalUsers.toLocaleString()} users &times; ${result.exchangesPerUser.toLocaleString()} exchanges/user = ${(result.totalUsers * result.exchangesPerUser).toLocaleString()} total exchanges</div>`);
+
+        lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Exchanges</th><th>KV/seq</th><th>Subtotal</th></tr></thead><tbody>');
+        for (const b of result.bucketDetails) {
+            lines.push(`<tr><td>${b.contextSize.toLocaleString()}</td><td>${b.percentage}%</td><td>${Math.round(b.exchanges).toLocaleString()}</td><td>${formatSizeHuman(b.kvBytesPerSeq)}</td><td>${formatSizeHuman(b.sizeBytes)}</td></tr>`);
+        }
+        lines.push(`</tbody><tfoot><tr><td colspan="4" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatSizeHuman(result.totalKVSizeBytes)}</td></tr></tfoot></table>`);
+        lines.push('</div>');
+
+        // Throughput breakdown
+        lines.push('<div class="plan-detail-section">');
+        lines.push('<strong>Throughput</strong>');
+        const totalExchPerSec = result.serverInstances * result.concurrentUsers * result.exchangeRatePerHour / 3600;
+        lines.push(`<div class="plan-detail-formula">${result.serverInstances.toLocaleString()} instances &times; ${result.concurrentUsers.toLocaleString()} concurrent users &times; ${result.exchangeRatePerHour}/hr = ${totalExchPerSec.toFixed(2)} exchanges/s</div>`);
+
+        lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Hit Rate</th><th>Writes</th><th>Reads</th></tr></thead><tbody>');
+        for (const b of result.bucketDetails) {
+            lines.push(`<tr><td>${b.contextSize.toLocaleString()}</td><td>${b.percentage}%</td><td>${b.cacheHitRate}%</td><td>${formatThroughputHuman(b.writeBytesPerSec / (1024 ** 3))}</td><td>${formatThroughputHuman(b.readBytesPerSec / (1024 ** 3))}</td></tr>`);
+        }
+        lines.push(`</tbody><tfoot><tr><td colspan="3" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatThroughputHuman(result.totalWriteGiBps)}</td><td style="font-weight: 600;">${formatThroughputHuman(result.totalReadGiBps)}</td></tr></tfoot></table>`);
+        lines.push('</div>');
+
+        return lines.join('');
+    }
+
+    // -----------------------------------------------------------------------
+    // Rollup detail: per-model contribution summary
+    // -----------------------------------------------------------------------
+    function buildRollupDetailHTML(allResults) {
+        const lines = [];
+        lines.push('<h3 style="margin-top: 10px;">Per-Model Breakdown</h3>');
+        lines.push('<table class="plan-detail-table"><thead><tr><th>Model</th><th>KV Cache Size</th><th>Write</th><th>Read</th></tr></thead><tbody>');
+        for (const { result, wsEntry } of allResults) {
+            lines.push(`<tr><td>${wsEntry.title}</td><td>${formatSizeHuman(result.totalKVSizeBytes)}</td><td>${formatThroughputHuman(result.totalWriteGiBps)}</td><td>${formatThroughputHuman(result.totalReadGiBps)}</td></tr>`);
+        }
+        lines.push('</tbody></table>');
+        return lines.join('');
+    }
+
+    // -----------------------------------------------------------------------
+    // Debounced recalculation — only updates outputs, never rebuilds inputs
+    // -----------------------------------------------------------------------
+    function scheduleRecalc() {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(updateOutputs, 200);
+    }
+
+    // Initial load and render
+    loadData();
+    render();
+
+    // Return cleanup function
+    return () => {
+        clearTimeout(debounceTimer);
+    };
+}

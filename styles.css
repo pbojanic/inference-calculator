@@ -1,0 +1,496 @@
+/* ===========================================================================
+   Inference Calculator – Global Styles (DDN branded)
+   =========================================================================== */
+:root {
+    --bg: #1A1B1D;
+    --surface: #242528;
+    --border: #3a3b3d;
+    --text: #D9D9D9;
+    --text-muted: #898A8A;
+    --accent: #D71612;
+    --accent-hover: #F04E23;
+    --input-bg: #2e2f32;
+    --success: #4ecdc4;
+    --card-bg: #2a2b2e;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    background: var(--bg); color: var(--text);
+    line-height: 1.5;
+}
+
+h1 { font-size: 1.4rem; margin-bottom: 4px; color: #fff; }
+h2 { font-size: 1.1rem; margin: 16px 0 8px; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+h3 { font-size: 0.95rem; margin: 12px 0 6px; color: #fff; }
+.subtitle { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0; }
+
+/* ===========================================================================
+   App header + Navigation
+   =========================================================================== */
+.app-header {
+    padding: 16px 20px 0;
+    border-bottom: 2px solid var(--accent);
+    background: var(--bg);
+}
+
+.header-brand {
+    display: flex; align-items: center; gap: 16px;
+    margin-bottom: 12px;
+}
+
+.header-logo { height: 40px; width: auto; }
+.header-text h1 { margin-bottom: 2px; }
+
+.nav-bar {
+    display: flex; gap: 4px;
+}
+
+.nav-link {
+    display: inline-block;
+    padding: 8px 20px;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.9rem;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.nav-link:hover { color: var(--text); }
+.nav-link.active {
+    color: #fff;
+    border-bottom-color: var(--accent);
+}
+
+/* ===========================================================================
+   Page content area
+   =========================================================================== */
+.page-content {
+    padding: 20px;
+    max-width: 1400px;
+    margin: 0 auto;
+}
+
+/* ===========================================================================
+   Panels and cards
+   =========================================================================== */
+.panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+}
+
+.card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+}
+
+.card:hover { border-color: var(--text-muted); }
+.card.selected { border-color: var(--accent); }
+
+/* ===========================================================================
+   Forms
+   =========================================================================== */
+label { display: block; font-size: 0.8rem; color: var(--text-muted); margin-top: 8px; }
+label:first-child { margin-top: 0; }
+
+select, input[type="number"], input[type="text"], input[type="password"], textarea {
+    width: 100%; padding: 6px 8px; margin-top: 2px;
+    background: var(--input-bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; font-size: 0.9rem; font-family: inherit;
+}
+
+textarea { min-height: 100px; font-size: 0.8rem; }
+input[type="range"] { width: 100%; margin-top: 2px; }
+
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+
+.toggle-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.toggle-row input[type="checkbox"] { width: 16px; height: 16px; }
+.toggle-row label { margin: 0; font-size: 0.85rem; color: var(--text); }
+
+/* ===========================================================================
+   Buttons
+   =========================================================================== */
+.actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+
+button {
+    padding: 8px 16px; border: none; border-radius: 4px;
+    font-size: 0.85rem; cursor: pointer; font-family: inherit;
+    transition: background 0.15s;
+}
+
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-secondary { background: var(--border); color: var(--text); }
+.btn-secondary:hover { background: #4a4b4d; }
+.btn-small { padding: 4px 10px; font-size: 0.75rem; }
+.btn-danger { background: #4a1a1a; color: var(--text); }
+.btn-danger:hover { background: #6b2020; }
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* ===========================================================================
+   Report / preformatted output
+   =========================================================================== */
+.report-output {
+    background: #1a1a1c; border: 1px solid var(--border); border-radius: 4px;
+    padding: 12px; font-family: 'Courier New', monospace; font-size: 0.8rem;
+    white-space: pre-wrap; word-break: break-word; max-height: 600px; overflow-y: auto;
+    line-height: 1.4;
+}
+
+/* ===========================================================================
+   Charts
+   =========================================================================== */
+.chart-container { position: relative; width: 100%; margin-top: 12px; }
+.charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 1100px) { .charts-grid { grid-template-columns: 1fr; } }
+
+/* ===========================================================================
+   Status / indicators
+   =========================================================================== */
+.warning { color: #F04E23; font-weight: bold; }
+.ok { color: #4ecdc4; }
+.auto-tag { font-size: 0.7rem; color: var(--accent); font-style: italic; }
+.status-ok { color: var(--success); font-size: 0.75rem; }
+.status-err { color: #F04E23; font-size: 0.75rem; }
+.status-loading { color: #ffeaa7; font-size: 0.75rem; }
+
+/* ===========================================================================
+   Modal / dialog overlay
+   =========================================================================== */
+.modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000;
+}
+
+.modal-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 24px;
+    max-width: 420px; width: 90%;
+}
+
+.modal-box p { margin-bottom: 16px; font-size: 0.95rem; }
+
+.modal-actions {
+    display: flex; gap: 8px; justify-content: flex-end;
+}
+
+/* ===========================================================================
+   Home page – settings
+   =========================================================================== */
+.settings-section {
+    margin-bottom: 20px;
+}
+
+.settings-section summary {
+    cursor: pointer; font-size: 0.9rem; color: var(--text-muted);
+    padding: 8px 0;
+}
+
+.settings-section summary:hover { color: var(--text); }
+
+.settings-body {
+    padding: 12px 0;
+}
+
+.token-row { display: flex; gap: 6px; align-items: flex-end; }
+.token-row input { flex: 1; }
+.token-row button { flex-shrink: 0; }
+.token-status { font-size: 0.7rem; color: var(--success); margin-top: 4px; min-height: 1.2em; }
+
+/* ===========================================================================
+   Home page – model list
+   =========================================================================== */
+.model-list {
+    display: flex; flex-direction: column; gap: 8px;
+    margin: 12px 0;
+}
+
+.model-card-name {
+    font-size: 0.95rem; font-weight: 600; color: #fff;
+    margin-bottom: 4px;
+}
+
+.model-card-stats {
+    display: flex; gap: 16px; font-size: 0.8rem; color: var(--text-muted);
+}
+
+.model-card-stats span { white-space: nowrap; }
+
+.model-detail-panel {
+    margin-top: 8px;
+    padding: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+
+.model-detail-row {
+    display: flex; gap: 16px; font-size: 0.85rem;
+    margin-bottom: 4px;
+}
+
+.model-detail-row .label { color: var(--text-muted); min-width: 140px; }
+
+.empty-state {
+    text-align: center;
+    padding: 40px 20px;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+/* ===========================================================================
+   Home page – add model
+   =========================================================================== */
+.add-model-section {
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+}
+
+.search-container { position: relative; margin-top: 8px; }
+
+.search-row {
+    display: flex; gap: 6px; align-items: flex-end;
+}
+
+.search-row input { flex: 1; }
+.search-row button { flex-shrink: 0; }
+
+.search-results {
+    position: absolute; top: 100%; left: 0; right: 0;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 0 0 6px 6px;
+    max-height: 320px; overflow-y: auto;
+    z-index: 100;
+}
+
+.search-result-item {
+    padding: 8px 12px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+}
+
+.search-result-item:hover { background: var(--input-bg); }
+.search-result-item:last-child { border-bottom: none; }
+
+.popular-models {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    margin-top: 8px;
+}
+
+.popular-chip {
+    padding: 4px 12px;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+}
+
+.popular-chip:hover {
+    border-color: var(--accent);
+    background: var(--surface);
+}
+
+/* ===========================================================================
+   Home page – edit model inline
+   =========================================================================== */
+.edit-form {
+    margin-top: 8px;
+    padding: 12px;
+    background: var(--surface);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+}
+
+/* ===========================================================================
+   Model Details page – layout
+   =========================================================================== */
+.detail-layout {
+    display: grid; grid-template-columns: 380px 1fr; gap: 20px;
+}
+
+@media (max-width: 900px) { .detail-layout { grid-template-columns: 1fr; } }
+
+.detail-back {
+    display: inline-block;
+    margin-bottom: 12px;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.85rem;
+}
+
+.detail-back:hover { color: var(--text); }
+
+/* ===========================================================================
+   GPUs page
+   =========================================================================== */
+.gpu-list {
+    display: flex; flex-direction: column; gap: 8px;
+    margin: 12px 0;
+}
+
+.gpu-card-name { font-weight: 600; color: #fff; }
+.gpu-card-mem { font-size: 0.85rem; color: var(--text-muted); }
+
+.gpu-form {
+    display: flex; gap: 8px; align-items: flex-end;
+    margin-top: 8px;
+}
+
+.gpu-form label { flex: 1; }
+.gpu-form button { flex-shrink: 0; align-self: flex-end; }
+
+/* ===========================================================================
+   Plan page
+   =========================================================================== */
+.plan-card {
+    margin-bottom: 16px;
+}
+
+.plan-card-header {
+    display: flex; align-items: baseline; gap: 12px;
+    margin-bottom: 10px;
+}
+
+.plan-card-title {
+    font-size: 1rem; font-weight: 600; color: #fff;
+}
+
+.plan-card-base {
+    font-size: 0.8rem; color: var(--text-muted);
+}
+
+.plan-inputs-row {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;
+}
+
+@media (max-width: 900px) {
+    .plan-inputs-row { grid-template-columns: repeat(3, 1fr); }
+}
+
+@media (max-width: 600px) {
+    .plan-inputs-row { grid-template-columns: 1fr 1fr; }
+}
+
+.distribution-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+
+.distribution-table th {
+    text-align: left;
+    color: var(--text-muted);
+    font-weight: normal;
+    font-size: 0.75rem;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border);
+}
+
+.distribution-table td {
+    padding: 4px 6px;
+}
+
+.distribution-table input {
+    width: 100%;
+    padding: 4px 6px;
+    font-size: 0.85rem;
+}
+
+.plan-results {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: var(--input-bg);
+    border-radius: 4px;
+}
+
+.plan-result-row {
+    display: flex; justify-content: space-between;
+    padding: 3px 0;
+    font-size: 0.9rem;
+}
+
+.plan-result-label {
+    color: var(--text-muted);
+}
+
+.plan-result-value {
+    color: #fff;
+    font-weight: 600;
+    font-family: 'Courier New', monospace;
+}
+
+.plan-rollup {
+    margin-top: 16px;
+    border-color: var(--accent);
+}
+
+.plan-details {
+    margin-top: 10px;
+}
+
+.plan-detail-section {
+    margin-top: 8px;
+}
+
+.plan-detail-formula {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin: 4px 0 6px;
+    font-family: 'Courier New', monospace;
+}
+
+.plan-detail-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    margin-top: 4px;
+}
+
+.plan-detail-table th {
+    text-align: left;
+    color: var(--text-muted);
+    font-weight: normal;
+    font-size: 0.7rem;
+    padding: 3px 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+.plan-detail-table td {
+    padding: 3px 8px;
+    font-family: 'Courier New', monospace;
+}
+
+.plan-detail-table tfoot td {
+    border-top: 1px solid var(--border);
+    padding-top: 4px;
+}
+
+/* ===========================================================================
+   Responsive
+   =========================================================================== */
+@media (max-width: 600px) {
+    .header-brand { flex-direction: column; align-items: flex-start; gap: 8px; }
+    .header-logo { height: 30px; }
+    .model-card-stats { flex-direction: column; gap: 4px; }
+}
