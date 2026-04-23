@@ -540,6 +540,13 @@ button:disabled {
     color: var(--text-muted);
     margin: 4px 0 6px;
     font-family: 'Courier New', monospace;
+    white-space: pre;
+    overflow-x: auto;
+}
+
+.plan-detail-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
 }
 
 .plan-detail-table {

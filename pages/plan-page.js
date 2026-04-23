@@ -623,29 +623,47 @@ function renderPlanPage(container) {
 
         lines.push('<h3 style="margin-top: 10px;">Calculation Details</h3>');
 
-        // KV Cache Size breakdown
+        // KV Cache Size derivation
+        const totalExchanges = result.totalUsers * result.exchangesPerUser;
+        const kvPreamble =
+            'total_exchanges = totalUsers × exchangesPerUser\n' +
+            `                = ${result.totalUsers.toLocaleString()} × ${result.exchangesPerUser.toLocaleString()}\n` +
+            `                = ${totalExchanges.toLocaleString()} stored exchanges`;
+
         lines.push('<div class="plan-detail-section">');
         lines.push('<strong>KV Cache Size</strong>');
-        lines.push(`<div class="plan-detail-formula">${result.totalUsers.toLocaleString()} users &times; ${result.exchangesPerUser.toLocaleString()} exchanges/user = ${(result.totalUsers * result.exchangesPerUser).toLocaleString()} total exchanges</div>`);
+        lines.push(`<div class="plan-detail-formula">${kvPreamble}</div>`);
 
+        lines.push('<div class="plan-detail-table-wrap">');
         lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Exchanges</th><th>KV/seq</th><th>Subtotal</th></tr></thead><tbody>');
         for (const b of result.bucketDetails) {
             lines.push(`<tr><td>${b.contextSize.toLocaleString()}</td><td>${b.percentage}%</td><td>${Math.round(b.exchanges).toLocaleString()}</td><td>${formatSizeHuman(b.kvBytesPerSeq)}</td><td>${formatSizeHuman(b.sizeBytes)}</td></tr>`);
         }
         lines.push(`</tbody><tfoot><tr><td colspan="4" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatSizeHuman(result.totalKVSizeBytes)}</td></tr></tfoot></table>`);
         lines.push('</div>');
+        lines.push('</div>');
 
-        // Throughput breakdown
+        // Throughput derivation
+        const ratePerSec = result.serverInstances * result.concurrentUsers * result.exchangeRatePerHour / 3600;
+        const tpPreamble =
+            'aggregate_exchanges_per_sec = serverInstances × concurrentUsers × exchangeRatePerHour ÷ 3600\n' +
+            `                            = ${result.serverInstances} × ${result.concurrentUsers} × ${result.exchangeRatePerHour} ÷ 3600\n` +
+            `                            = ${ratePerSec.toFixed(3)} exchanges/sec`;
+
         lines.push('<div class="plan-detail-section">');
         lines.push('<strong>Throughput</strong>');
-        const totalExchPerSec = result.serverInstances * result.concurrentUsers * result.exchangeRatePerHour / 3600;
-        lines.push(`<div class="plan-detail-formula">${result.serverInstances.toLocaleString()} instances &times; ${result.concurrentUsers.toLocaleString()} concurrent users &times; ${result.exchangeRatePerHour}/hr = ${totalExchPerSec.toFixed(2)} exchanges/s</div>`);
+        lines.push(`<div class="plan-detail-formula">${tpPreamble}</div>`);
 
-        lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Hit Rate</th><th>Writes</th><th>Reads</th></tr></thead><tbody>');
+        lines.push('<div class="plan-detail-table-wrap">');
+        lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Exch/sec</th><th>Hit Rate</th><th>Hits/sec</th><th>Misses/sec</th><th>Write</th><th>Read</th></tr></thead><tbody>');
         for (const b of result.bucketDetails) {
-            lines.push(`<tr><td>${b.contextSize.toLocaleString()}</td><td>${b.percentage}%</td><td>${b.cacheHitRate}%</td><td>${formatThroughputHuman(b.writeBytesPerSec / (1024 ** 3))}</td><td>${formatThroughputHuman(b.readBytesPerSec / (1024 ** 3))}</td></tr>`);
+            const hitFrac = b.cacheHitRate / 100;
+            const hitsPerSec = b.exchangesPerSec * hitFrac;
+            const missesPerSec = b.exchangesPerSec * (1 - hitFrac);
+            lines.push(`<tr><td>${b.contextSize.toLocaleString()}</td><td>${b.percentage}%</td><td>${b.exchangesPerSec.toFixed(3)}</td><td>${b.cacheHitRate}%</td><td>${hitsPerSec.toFixed(3)}</td><td>${missesPerSec.toFixed(3)}</td><td>${formatThroughputHuman(b.writeBytesPerSec / (1024 ** 3))}</td><td>${formatThroughputHuman(b.readBytesPerSec / (1024 ** 3))}</td></tr>`);
         }
-        lines.push(`</tbody><tfoot><tr><td colspan="3" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatThroughputHuman(result.totalWriteGiBps)}</td><td style="font-weight: 600;">${formatThroughputHuman(result.totalReadGiBps)}</td></tr></tfoot></table>`);
+        lines.push(`</tbody><tfoot><tr><td colspan="6" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatThroughputHuman(result.totalWriteGiBps)}</td><td style="font-weight: 600;">${formatThroughputHuman(result.totalReadGiBps)}</td></tr></tfoot></table>`);
+        lines.push('</div>');
         lines.push('</div>');
 
         return lines.join('');

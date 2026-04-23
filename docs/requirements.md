@@ -320,15 +320,33 @@ Below all model entries, display an aggregate summary:
 
 ### Calculation details toggle
 
-A "Show calculation details" checkbox appears between the model cards and the roll-up summary. When enabled, each model card and the roll-up display additional detail breakdowns:
+A "Show calculation details" checkbox appears between the model cards and the roll-up summary. When enabled, each model card and the roll-up display additional detail breakdowns intended to let a reader (typically a sales engineer in conversation with a customer) audit every headline KV-cache and throughput number back to the inputs that produced it. The breakdowns deliberately do not re-derive architectural details (number of layers, heads, etc.) — those live on the Model Details page. The reader is assumed to trust the per-sequence KV cache size for each model and to be auditing only how the plan inputs compose into the aggregate.
 
-**Per-model details** show:
-- **KV Cache Size breakdown**: the total exchange count (total users x exchanges/user), then a table showing each distribution bucket's context size, percentage, number of exchanges, KV cache per sequence, and size subtotal. Summarized with the total.
-- **Throughput breakdown**: the aggregate exchange rate (server instances x concurrent users x rate/hr), then a table showing each bucket's context size, percentage, cache hit rate, write throughput, and read throughput. Summarized with totals.
+**Per-model details** show, in this order:
 
-**Roll-up details** show a per-model summary table with each model's GPU count (`serverInstances × deployment.tp`), KV cache size, write throughput, and read throughput.
+1. **KV cache size derivation** — a three-line preamble written out with the actual plan inputs substituted:
 
-These details stay at a high level (KV cache sizes, exchange counts, throughput rates) and do not replicate model architecture details available on the Model Details page.
+   ```
+   total_exchanges = totalUsers × exchangesPerUser
+                   = 100 × 50
+                   = 5,000 stored exchanges
+   ```
+
+   followed by the per-bucket table with columns: context size, percentage, exchanges, KV cache per sequence, size subtotal. A summary row shows the model's total.
+
+2. **Throughput derivation** — a three-line preamble showing the per-second conversion with substituted values:
+
+   ```
+   aggregate_exchanges_per_sec = serverInstances × concurrentUsers × exchangeRatePerHour ÷ 3600
+                               = 10 × 10 × 10 ÷ 3600
+                               = 0.278 exchanges/sec
+   ```
+
+   followed by the per-bucket table with columns: context size, percentage, **exchanges/sec**, cache hit rate, **hits/sec**, **misses/sec**, write GiB/s, read GiB/s. The hits/misses columns make the cache-hit mechanism explicit — misses drive writes, hits drive reads — rather than leaving the reader to infer the split from the headline write/read values. A summary row shows totals.
+
+Every formula preamble uses the three-line symbolic → substituted → result form so a customer reading over the sales engineer's shoulder can reproduce the math step by step.
+
+**Roll-up details** show a per-model summary table with each model's GPU count (`serverInstances × deployment.tp`), KV cache size, write throughput, and read throughput. Totals appear in a summary row.
 
 ### Auto-calculation
 
