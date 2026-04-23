@@ -447,6 +447,50 @@ button:disabled {
     cursor: not-allowed;
 }
 
+/* ===========================================================================
+   References page
+   =========================================================================== */
+.references-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 20px;
+    max-width: 900px;
+}
+
+.reference-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+}
+
+.reference-title-row {
+    margin-bottom: 2px;
+}
+
+.reference-title {
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 0.95rem;
+    text-decoration: none;
+}
+
+.reference-title:hover {
+    text-decoration: underline;
+}
+
+.reference-meta {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    margin-bottom: 4px;
+}
+
+.reference-note {
+    font-size: 0.85rem;
+    line-height: 1.4;
+}
+
 .plan-results {
     margin-top: 12px;
     padding: 10px 12px;

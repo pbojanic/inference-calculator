@@ -15,7 +15,34 @@ If I navigate away from a page with unsaved changes, the application should warn
 
 ### Navigation
 
-A global menu is always visible, providing quick access to the Models page, GPUs page, Plan page, and Settings page. The current page should be visually indicated.
+A global menu is always visible, providing quick access to the Models page, GPUs page, Plan page, References page, and Settings page. The current page should be visually indicated.
+
+
+## References page
+
+The References page is a dedicated top-level page accessible from the navigation bar. Its purpose is to give sales engineers a compact, defensible bibliography they can use when discussing inference sizing, context-length workload assumptions, and KV-cache memory behavior with customers.
+
+### Content
+
+The page lists a curated set of compelling, peer-reviewed or industry-authoritative studies, grouped into short sections:
+
+- **Long-context evaluation benchmarks** — RULER (NVIDIA), LongBench (Tsinghua), Lost in the Middle (Liu et al.).
+- **Real-world inference workloads** — MLPerf Inference (MLCommons) reference datasets and workload definitions.
+- **Model capability reports** — Gemini 1.5 Technical Report (DeepMind), and other model-family technical reports as they become relevant.
+- **Vendor sizing guides** — VMware LLM Inference Sizing and Performance Guidance (Broadcom/VMware), Lenovo LLM Sizing Guide.
+
+Each entry shows:
+- The title.
+- Primary authors or publishing organization.
+- Venue and year (e.g., "COLM 2024", "TACL 2024", "MLCommons, 2024").
+- A one-sentence "why it matters for sizing" note grounded in the Plan-page use case.
+- An external link that opens in a new tab (`target="_blank" rel="noopener noreferrer"`).
+
+Local PDFs bundled in the repo (e.g., Lenovo and VMware sizing guides in `docs/`) are referenced via relative links so they work in offline environments.
+
+### Maintenance
+
+Every entry on the References page must have been verified (link opens to the correct document, authors and venue confirmed) before being added. If a link rots or a paper is superseded, update or remove the entry rather than leaving a stale reference.
 
 
 ## Settings page
