@@ -379,21 +379,27 @@ The Graphs page is a dedicated top-level page accessible from the navigation bar
 One card per workspace model, in the same order as the Plan page. Each card shows:
 
 - The model title (matches the Plan page title).
-- Two stacked line charts: **Write throughput (GiB/s)** on top, **Read throughput (GiB/s)** below, sharing the same x-axis.
+- Two stacked charts: **Write throughput (GiB/s)** on top, **Read throughput (GiB/s)** below, sharing the same x-axis (GiB/s).
 
-### First chart: throughput vs concurrent users
+### First chart: throughput range at a fixed concurrency
 
-- **x-axis:** concurrent users, swept from 0 to `max(1.5 × concurrentUsers.high, 20)`.
-- **y-axis:** GiB/s (write or read depending on which chart).
-- **Three curves per chart:**
-  - **Low** — computed with `exchangeRatePerHour = exchangeRatePerHourLow`, per-bucket cacheHitRate unchanged.
-  - **Expected** — computed with `exchangeRatePerHour = exchangeRatePerHourExpected`, per-bucket cacheHitRate unchanged. Drawn as a solid line.
-  - **High** — computed with `exchangeRatePerHour = exchangeRatePerHourHigh`, per-bucket cacheHitRate unchanged.
-- **Cone shading:** filled area between the Low and High curves, semi-transparent, same color family as the Expected line.
-- **Vertical markers:** three dashed vertical lines at x = `concurrentUsersLow`, `concurrentUsersExpected`, `concurrentUsersHigh`. Marker at Expected is slightly darker.
+The chart answers "at this customer's stated concurrency, what range of throughput do I need to provision?" The concurrent-user count is **held fixed at the Plan-page Expected value** (the customer-supplied number). The uncertainty comes from the `exchangeRatePerHour` triple.
+
+- **Chart type:** horizontal floating-bar (range bar) per output (Write, Read).
+- **x-axis:** GiB/s, starting at 0, upper bound set dynamically to `1.15 × Max` (so the Max label has headroom).
+- **Bar:** spans from `Min` GiB/s to `Max` GiB/s, semi-transparent in the accent color.
+- **Expected marker:** a solid vertical tick across the bar at the Expected GiB/s value, rendered slightly darker than the bar fill.
+- **Three computed values:**
+  - **Min** — `calculatePlanEntry` with `concurrentUsers = plan.concurrentUsers` (Expected), `exchangeRatePerHour = exchangeRatePerHourLow`, per-bucket `cacheHitRate` unchanged.
+  - **Expected** — same, but with `exchangeRatePerHour = exchangeRatePerHour` (Expected). Matches the Plan page's headline throughput.
+  - **Max** — same, but with `exchangeRatePerHour = exchangeRatePerHourHigh`.
+- **Numeric labels:** three labels rendered on the chart — `Min 0.12`, `Expected 0.24`, `Max 0.36` (values formatted to match the Plan page's `formatThroughputHuman`) — positioned beneath the bar at the corresponding x coordinates.
+- **Title:** each chart's title reads `Write throughput — at N concurrent users` (or Read), where N is the fixed Expected concurrent-users value. The title makes the fixed point explicit.
+
+The `concurrentUsers` triple's Low and High values are **not used by this chart**. They remain in the data model for future graph types that vary concurrency.
 
 ### Empty and edge states
 
 - **No workspace models:** page shows empty state directing the user to the Home page to add a model.
 - **No plan data for a model:** card shows empty state directing the user to the Plan page.
-- **All three triple values equal (no uncertainty):** the cone collapses to a single line — the Expected curve. Low and High lines overlap the Expected line. This is the no-uncertainty default and must render cleanly.
+- **No uncertainty** (the `exchangeRatePerHour` triple's low, expected, and high are all equal): the range bar collapses to zero width. The Expected marker is still drawn, plus a visual fallback (a small filled dot or minimum-width bar) ensures the chart is not blank.

@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------------------
-// Graphs page: visualizes Plan-page data as throughput-vs-concurrent-users
-// line charts with a shaded cone derived from scenario triples.
+// Graphs page: visualizes Plan-page data as horizontal range bars showing
+// the Min / Expected / Max throughput required to support a customer-supplied
+// concurrency, where uncertainty comes from the exchangeRatePerHour triple.
 // ---------------------------------------------------------------------------
 
 function renderGraphsPage(container) {
@@ -17,9 +18,9 @@ function renderGraphsPage(container) {
         const intro = document.createElement('p');
         intro.style.cssText = 'margin: 0 0 16px; color: var(--text-muted); max-width: 780px;';
         intro.textContent =
-            'Throughput as a function of concurrent users for each workspace model. ' +
-            'The shaded cone reflects the Low/High bounds on the Exchange-rate-per-hour triple set on the Plan page; ' +
-            'dashed vertical markers show your Low, Expected, and High concurrent-user values.';
+            'Throughput range required to support each model at the customer-supplied concurrency. ' +
+            'The bar spans from Min (rate=low) to Max (rate=high) of the Exchange-rate-per-hour triple; ' +
+            'the solid vertical marker inside the bar is the Expected throughput that matches the Plan page.';
         container.appendChild(intro);
 
         const workspaceModels = getWorkspaceModels();
@@ -67,70 +68,51 @@ function renderGraphsPage(container) {
             return card;
         }
 
-        // Compute sweep data once per card, reuse across write + read charts
-        const { xValues, writeSeries, readSeries, markers, accentColor } = computeSeries(plan, wsEntry);
+        const points = computePoints(plan, wsEntry);
 
-        // Write chart
         const writeWrap = document.createElement('div');
         writeWrap.className = 'graphs-chart-wrap';
         const writeCanvas = document.createElement('canvas');
         writeWrap.appendChild(writeCanvas);
         card.appendChild(writeWrap);
-        chartInstances.push(buildChart(writeCanvas, xValues, writeSeries, markers, 'Write throughput (GiB/s)', accentColor));
+        chartInstances.push(buildRangeBarChart(
+            writeCanvas,
+            points.write,
+            `Write throughput — at ${plan.concurrentUsers.toLocaleString()} concurrent users`
+        ));
 
-        // Read chart
         const readWrap = document.createElement('div');
         readWrap.className = 'graphs-chart-wrap';
         const readCanvas = document.createElement('canvas');
         readWrap.appendChild(readCanvas);
         card.appendChild(readWrap);
-        chartInstances.push(buildChart(readCanvas, xValues, readSeries, markers, 'Read throughput (GiB/s)', accentColor));
+        chartInstances.push(buildRangeBarChart(
+            readCanvas,
+            points.read,
+            `Read throughput — at ${plan.concurrentUsers.toLocaleString()} concurrent users`
+        ));
 
         return card;
     }
 
-    // Sweep concurrentUsers and compute write/read throughput at low, expected,
-    // and high values of exchangeRatePerHour for each sweep step.
-    function computeSeries(plan, wsEntry) {
-        const xMax = Math.max(1.5 * (plan.concurrentUsersHigh || plan.concurrentUsers), 20);
-        const STEPS = 25;
-        const xValues = [];
-        for (let i = 0; i <= STEPS; i++) {
-            xValues.push(Math.round(xMax * i / STEPS));
-        }
+    // Compute three scalar throughput values (min/expected/max GiB/s) for each
+    // of write and read, holding concurrentUsers fixed at the Plan-page Expected
+    // value and sweeping exchangeRatePerHour across its triple.
+    function computePoints(plan, wsEntry) {
+        const cc = plan.concurrentUsers;
 
-        const writeLow = [], writeExp = [], writeHigh = [];
-        const readLow = [], readExp = [], readHigh = [];
+        const rMin = safeCalc({ ...plan, concurrentUsers: cc, exchangeRatePerHour: plan.exchangeRatePerHourLow }, wsEntry);
+        const rExp = safeCalc({ ...plan, concurrentUsers: cc, exchangeRatePerHour: plan.exchangeRatePerHour }, wsEntry);
+        const rMax = safeCalc({ ...plan, concurrentUsers: cc, exchangeRatePerHour: plan.exchangeRatePerHourHigh }, wsEntry);
 
-        for (const cc of xValues) {
-            const base = { ...plan, concurrentUsers: Math.max(1, cc) };
-
-            const rLow = safeCalc({ ...base, exchangeRatePerHour: plan.exchangeRatePerHourLow }, wsEntry);
-            const rExp = safeCalc({ ...base, exchangeRatePerHour: plan.exchangeRatePerHour }, wsEntry);
-            const rHigh = safeCalc({ ...base, exchangeRatePerHour: plan.exchangeRatePerHourHigh }, wsEntry);
-
-            // First sweep point is cc=0: force throughput to 0 (avoid div-by-zero artifacts)
-            const scale = cc === 0 ? 0 : 1;
-            writeLow.push(rLow ? rLow.totalWriteGiBps * scale : 0);
-            writeExp.push(rExp ? rExp.totalWriteGiBps * scale : 0);
-            writeHigh.push(rHigh ? rHigh.totalWriteGiBps * scale : 0);
-            readLow.push(rLow ? rLow.totalReadGiBps * scale : 0);
-            readExp.push(rExp ? rExp.totalReadGiBps * scale : 0);
-            readHigh.push(rHigh ? rHigh.totalReadGiBps * scale : 0);
-        }
-
-        const markers = [
-            { value: plan.concurrentUsersLow, label: 'Low', emphasized: false },
-            { value: plan.concurrentUsers, label: 'Expected', emphasized: true },
-            { value: plan.concurrentUsersHigh, label: 'High', emphasized: false }
-        ];
+        const fallback = { totalWriteGiBps: 0, totalReadGiBps: 0 };
+        const min = rMin || fallback;
+        const exp = rExp || fallback;
+        const max = rMax || fallback;
 
         return {
-            xValues,
-            writeSeries: { low: writeLow, expected: writeExp, high: writeHigh },
-            readSeries: { low: readLow, expected: readExp, high: readHigh },
-            markers,
-            accentColor: '#D71612'
+            write: { min: min.totalWriteGiBps, expected: exp.totalWriteGiBps, max: max.totalWriteGiBps },
+            read:  { min: min.totalReadGiBps,  expected: exp.totalReadGiBps,  max: max.totalReadGiBps  }
         };
     }
 
@@ -142,110 +124,110 @@ function renderGraphsPage(container) {
         }
     }
 
-    function buildChart(canvas, xValues, series, markers, title, accentColor) {
+    // Render a horizontal range bar: [Min ──●── Max], with the Expected value
+    // marked by a solid vertical tick and three numeric labels drawn under the
+    // bar. Uses Chart.js "floating bar" (data = [[low, high]]).
+    function buildRangeBarChart(canvas, vals, title) {
         const ctx = canvas.getContext('2d');
+        const accent = '#D71612';
 
-        const verticalMarkersPlugin = {
-            id: 'verticalMarkers',
+        // Axis upper bound: leave 15% headroom above the Max label.
+        const rawMax = Math.max(vals.max, vals.expected, 0);
+        const xMax = rawMax > 0 ? rawMax * 1.15 : 1;
+
+        // When Min ≈ Max (no uncertainty) the floating bar renders as zero
+        // width. Widen just enough to be visible so the chart never looks blank.
+        const hasRange = (vals.max - vals.min) > xMax * 0.001;
+        const barLo = hasRange ? vals.min : Math.max(0, vals.expected - xMax * 0.01);
+        const barHi = hasRange ? vals.max : vals.expected + xMax * 0.01;
+
+        const annotations = {
+            id: 'rangeBarAnnotations',
             afterDatasetsDraw(chart) {
-                const { ctx, chartArea, scales: { x } } = chart;
-                ctx.save();
-                for (const m of markers) {
-                    const px = x.getPixelForValue(m.value);
-                    if (px < chartArea.left || px > chartArea.right) continue;
-                    ctx.strokeStyle = m.emphasized ? '#ffffff' : '#888888';
-                    ctx.lineWidth = m.emphasized ? 1.5 : 1;
-                    ctx.setLineDash([4, 4]);
-                    ctx.beginPath();
-                    ctx.moveTo(px, chartArea.top);
-                    ctx.lineTo(px, chartArea.bottom);
-                    ctx.stroke();
+                const { ctx: c, chartArea, scales: { x } } = chart;
+                const midY = (chartArea.top + chartArea.bottom) / 2;
+                const barTop = midY - 14;
+                const barBottom = midY + 14;
 
-                    // Label above chart area
-                    ctx.setLineDash([]);
-                    ctx.fillStyle = m.emphasized ? '#ffffff' : '#aaaaaa';
-                    ctx.font = '10px sans-serif';
-                    ctx.textAlign = 'center';
-                    ctx.fillText(m.label, px, chartArea.top - 2);
+                // Expected tick
+                const expPx = x.getPixelForValue(vals.expected);
+                c.save();
+                c.strokeStyle = accent;
+                c.lineWidth = 2.5;
+                c.beginPath();
+                c.moveTo(expPx, barTop);
+                c.lineTo(expPx, barBottom);
+                c.stroke();
+                c.restore();
+
+                // Numeric labels under the bar
+                const labelY = barBottom + 14;
+                c.save();
+                c.fillStyle = '#ccc';
+                c.font = '11px sans-serif';
+                c.textBaseline = 'top';
+
+                const labels = [
+                    { x: vals.min,      text: `Min ${formatThroughputHuman(vals.min)}`,       align: 'left'   },
+                    { x: vals.expected, text: `Expected ${formatThroughputHuman(vals.expected)}`, align: 'center' },
+                    { x: vals.max,      text: `Max ${formatThroughputHuman(vals.max)}`,       align: 'right'  }
+                ];
+                for (const lab of labels) {
+                    c.textAlign = lab.align;
+                    const px = x.getPixelForValue(lab.x);
+                    // Clamp label x to keep text inside the chart area
+                    const clamped = Math.min(Math.max(px, chartArea.left + 2), chartArea.right - 2);
+                    c.fillText(lab.text, clamped, labelY);
                 }
-                ctx.restore();
+                c.restore();
             }
         };
 
         return new Chart(ctx, {
-            type: 'line',
+            type: 'bar',
             data: {
-                labels: xValues,
-                datasets: [
-                    {
-                        label: 'Low',
-                        data: series.low,
-                        borderColor: 'transparent',
-                        pointRadius: 0,
-                        fill: false
-                    },
-                    {
-                        label: 'High',
-                        data: series.high,
-                        borderColor: 'transparent',
-                        backgroundColor: accentColor + '26', // ~15% alpha
-                        pointRadius: 0,
-                        fill: '-1' // fill down to the previous dataset (Low)
-                    },
-                    {
-                        label: 'Expected',
-                        data: series.expected,
-                        borderColor: accentColor,
-                        borderWidth: 2,
-                        pointRadius: 0,
-                        fill: false,
-                        tension: 0.15
-                    }
-                ]
+                labels: [''],
+                datasets: [{
+                    data: [[barLo, barHi]],
+                    backgroundColor: accent + '33',
+                    borderColor: accent + '99',
+                    borderWidth: 1,
+                    borderSkipped: false,
+                    barThickness: 28
+                }]
             },
             options: {
+                indexAxis: 'y',
                 responsive: true,
                 maintainAspectRatio: false,
                 plugins: {
-                    legend: {
-                        display: true,
-                        labels: {
-                            color: '#ccc',
-                            filter: item => item.text === 'Expected'
-                        }
-                    },
-                    title: {
-                        display: true,
-                        text: title,
-                        color: '#fff',
-                        font: { size: 12 }
-                    },
+                    legend: { display: false },
+                    title: { display: true, text: title, color: '#fff', font: { size: 12 } },
                     tooltip: {
-                        mode: 'index',
-                        intersect: false,
                         callbacks: {
-                            title: items => `Concurrent users: ${items[0].label}`,
-                            label: item => `${item.dataset.label}: ${item.parsed.y.toFixed(4)} GiB/s`
+                            label: () =>
+                                `Min ${formatThroughputHuman(vals.min)}  |  ` +
+                                `Expected ${formatThroughputHuman(vals.expected)}  |  ` +
+                                `Max ${formatThroughputHuman(vals.max)}`
                         }
                     }
                 },
                 scales: {
                     x: {
-                        type: 'linear',
-                        title: { display: true, text: 'Concurrent users', color: '#aaa' },
+                        beginAtZero: true,
+                        max: xMax,
+                        title: { display: true, text: 'GiB/s', color: '#aaa' },
                         ticks: { color: '#aaa' },
                         grid: { color: '#333' }
                     },
                     y: {
-                        beginAtZero: true,
-                        title: { display: true, text: 'GiB/s', color: '#aaa' },
-                        ticks: { color: '#aaa' },
-                        grid: { color: '#333' }
+                        ticks: { display: false },
+                        grid: { display: false }
                     }
                 },
-                interaction: { mode: 'nearest', axis: 'x', intersect: false }
+                layout: { padding: { bottom: 24 } } // room for numeric labels drawn under the bar
             },
-            plugins: [verticalMarkersPlugin]
+            plugins: [annotations]
         });
     }
 
