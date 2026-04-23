@@ -15,7 +15,7 @@ If I navigate away from a page with unsaved changes, the application should warn
 
 ### Navigation
 
-A global menu is always visible, providing quick access to the Models page, GPUs page, Plan page, References page, and Settings page. The current page should be visually indicated.
+A global menu is always visible, providing quick access to the Models page, GPUs page, Plan page, Graphs page, References page, and Settings page. The current page should be visually indicated.
 
 
 ## References page
@@ -213,9 +213,9 @@ Each plan entry has the following editable fields:
 
 - **Server instances** (positive integer, default 1) — the number of inference server instances running this model. This equals total GPUs divided by the model's tensor parallelism setting. More instances means more IO to the shared storage.
 - **Total users** (positive integer, default 100) — the total number of users who have stored KV caches for this model.
-- **Concurrent users** (positive integer, default 10) — the number of users actively using the model at any given moment. Must be less than or equal to total users.
+- **Concurrent users** (*triple*: low / expected / high, each a positive integer; expected default 10) — the number of users actively using the model at any given moment. Must be less than or equal to total users. The Plan page's headline KV-cache and throughput calculations use the **Expected** value. Low and High values are only consulted by the Graphs page. Default values for Low and High are equal to Expected (i.e. no uncertainty until the user widens the range).
 - **Stored exchanges per user** (positive integer, default 50) — the number of distinct input contexts (exchanges) stored per user. For chat applications this might be ~50; for coding agents ~200. This drives the size calculation.
-- **Exchange rate per hour** (positive number, default 10) — the number of new exchanges generated per concurrent user per hour. This drives the throughput calculation.
+- **Exchange rate per hour** (*triple*: low / expected / high, each a positive number; expected default 10) — the number of new exchanges generated per concurrent user per hour. Same Expected-drives-Plan-page, triple-drives-Graphs rule applies.
 - **Derived GPU count** — Each plan entry displays the total number of GPUs the planned deployment represents, calculated as:
 
   ```
@@ -223,6 +223,8 @@ Each plan entry has the following editable fields:
   ```
 
   where `deployment.tp` is the tensor-parallel value configured on the model's Model Details page (default 1). The derived value is shown inline next to the Server instances input as muted read-only text (e.g. `→ 80 GPUs (TP=8)`), and updates automatically whenever the server-instance count changes on the Plan page or the tensor-parallel setting is changed on the Model Details page. The value is read-only — it can only be influenced by editing its two inputs. For models deployed at TP=1, the readout shows just the GPU count (e.g. `→ 1 GPUs`).
+
+**Scenario triples** — Selected fuzzy inputs (*Concurrent users*, *Exchange rate per hour*) are captured as `{low, expected, high}` triples rather than single numbers. The Plan page's headline computations and the Calculation details view continue to use only the Expected value, preserving current behavior. The Graphs page consumes the triples to render cones of uncertainty. Validation: `low ≤ expected ≤ high` for each triple, all values positive.
 
 ### Input token distribution
 
@@ -366,3 +368,32 @@ Plan data is included in the Settings Export/Import operations. The Import confi
 - If a workspace model's deployment settings change (e.g., context length reduced), distribution buckets with context sizes exceeding the new maximum are flagged with a validation error on the Plan page.
 - If the workspace is empty, the Plan page shows an empty state message directing the user to add models on the Home page.
 - The Save button is disabled when validation errors exist.
+
+
+## Graphs page
+
+The Graphs page is a dedicated top-level page accessible from the navigation bar, between Plan and References. Its purpose is to let a sales engineer visualize how a planned deployment's throughput scales with concurrent users and how wide the uncertainty band is. The page consumes plan data saved to `gpu_calc_plan` — it does not have its own inputs. If no plan data exists for a workspace model, the card shows an empty state directing the user to the Plan page.
+
+### Layout
+
+One card per workspace model, in the same order as the Plan page. Each card shows:
+
+- The model title (matches the Plan page title).
+- Two stacked line charts: **Write throughput (GiB/s)** on top, **Read throughput (GiB/s)** below, sharing the same x-axis.
+
+### First chart: throughput vs concurrent users
+
+- **x-axis:** concurrent users, swept from 0 to `max(1.5 × concurrentUsers.high, 20)`.
+- **y-axis:** GiB/s (write or read depending on which chart).
+- **Three curves per chart:**
+  - **Low** — computed with `exchangeRatePerHour = exchangeRatePerHourLow`, per-bucket cacheHitRate unchanged.
+  - **Expected** — computed with `exchangeRatePerHour = exchangeRatePerHourExpected`, per-bucket cacheHitRate unchanged. Drawn as a solid line.
+  - **High** — computed with `exchangeRatePerHour = exchangeRatePerHourHigh`, per-bucket cacheHitRate unchanged.
+- **Cone shading:** filled area between the Low and High curves, semi-transparent, same color family as the Expected line.
+- **Vertical markers:** three dashed vertical lines at x = `concurrentUsersLow`, `concurrentUsersExpected`, `concurrentUsersHigh`. Marker at Expected is slightly darker.
+
+### Empty and edge states
+
+- **No workspace models:** page shows empty state directing the user to the Home page to add a model.
+- **No plan data for a model:** card shows empty state directing the user to the Plan page.
+- **All three triple values equal (no uncertainty):** the cone collapses to a single line — the Expected curve. Low and High lines overlap the Expected line. This is the no-uncertainty default and must render cleanly.
