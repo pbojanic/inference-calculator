@@ -169,8 +169,10 @@ The application ships with a pre-populated list of common GPUs:
 - A100 80GB (79.7 GB usable)
 - H100 80GB (79.7 GB usable)
 - H200 94GB (93.1 GB usable)
+- B300 288GB (288.0 GB usable) — NVIDIA Blackwell Ultra, HBM3e
+- Vera Rubin 288GB (288.0 GB usable) — NVIDIA Rubin GPU, HBM4
 
-On first launch, these defaults are copied into local storage. From that point on, the list is managed entirely locally.
+On first launch, these defaults are copied into local storage. From that point on, the list is managed entirely locally. Users whose GPU list was already populated from an earlier version of the app will not automatically receive newly added defaults; they can pick them up by pressing "Reset to defaults" on the GPUs page or by adding them manually.
 
 ### GPU list
 

@@ -7,7 +7,9 @@ const DEFAULT_GPUS = {
     gpu_default_1: { id: 'gpu_default_1', name: 'A100 40GB', memoryGB: 39.6 },
     gpu_default_2: { id: 'gpu_default_2', name: 'A100 80GB', memoryGB: 79.7 },
     gpu_default_3: { id: 'gpu_default_3', name: 'H100 80GB', memoryGB: 79.7 },
-    gpu_default_4: { id: 'gpu_default_4', name: 'H200 94GB', memoryGB: 93.1 }
+    gpu_default_4: { id: 'gpu_default_4', name: 'H200 94GB', memoryGB: 93.1 },
+    gpu_default_5: { id: 'gpu_default_5', name: 'B300 288GB', memoryGB: 288.0 },
+    gpu_default_6: { id: 'gpu_default_6', name: 'Vera Rubin 288GB', memoryGB: 288.0 }
 };
 
 function initGpuStore() {
