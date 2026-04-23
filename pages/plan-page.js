@@ -5,6 +5,25 @@
 
 const LS_PLAN_KEY = 'gpu_calc_plan';
 
+// Context size presets for distribution buckets — log-spaced, each mapped to a
+// recognizable use case so a sales engineer can pick a realistic workload.
+const CONTEXT_PRESETS = [
+    { value: 512,     label: '512 · Short Q&A',  title: 'Single query / FAQ' },
+    { value: 2048,    label: '2K · Chat',        title: 'Standard chat turn' },
+    { value: 8192,    label: '8K · Support',     title: 'Long chat / support transcript' },
+    { value: 16384,   label: '16K · Summarize',  title: 'Document summarization' },
+    { value: 32768,   label: '32K · RAG',        title: 'Multi-doc RAG' },
+    { value: 131072,  label: '128K · Book',      title: 'Full book / large codebase' },
+    { value: 204800,  label: '200K · Agent',     title: 'Long-context agent (Claude-class)' },
+    { value: 1048576, label: '1M · Repo',        title: 'Frontier long-context (full repo)' },
+];
+
+function formatContextTokens(n) {
+    if (n >= 1048576) return `${Math.round(n / 1048576)}M`;
+    if (n >= 1024) return `${Math.round(n / 1024)}K`;
+    return `${n}`;
+}
+
 function _getPlanStore() {
     const raw = localStorage.getItem(LS_PLAN_KEY);
     if (!raw) return {};
@@ -478,6 +497,30 @@ function renderPlanPage(container) {
             bucket.contextSize = parseInt(ctxInput.value) || 0;
             markDirty(); scheduleRecalc();
         };
+
+        // Preset chip row — fills the input on click; chips over the model's
+        // max context render disabled with a tooltip explaining the limit.
+        const presetRow = document.createElement('div');
+        presetRow.className = 'context-preset-row';
+        for (const preset of CONTEXT_PRESETS) {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'context-preset-chip';
+            chip.textContent = preset.label;
+            if (preset.value > maxCtx) {
+                chip.disabled = true;
+                chip.classList.add('context-preset-chip--over-limit');
+                chip.title = `Exceeds model's ${formatContextTokens(maxCtx)} context`;
+            } else {
+                chip.title = preset.title;
+                chip.onclick = () => {
+                    ctxInput.value = preset.value;
+                    ctxInput.dispatchEvent(new Event('input', { bubbles: true }));
+                };
+            }
+            presetRow.appendChild(chip);
+        }
+        tdCtx.appendChild(presetRow);
         tdCtx.appendChild(ctxInput);
         tr.appendChild(tdCtx);
 

@@ -417,6 +417,36 @@ button:disabled {
     font-size: 0.85rem;
 }
 
+.context-preset-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 6px;
+    max-width: 360px;
+}
+
+.context-preset-chip {
+    padding: 2px 8px;
+    background: var(--input-bg);
+    color: inherit;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+}
+
+.context-preset-chip:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: var(--surface);
+}
+
+.context-preset-chip:disabled,
+.context-preset-chip--over-limit {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
 .plan-results {
     margin-top: 12px;
     padding: 10px 12px;

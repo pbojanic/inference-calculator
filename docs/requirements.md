@@ -198,6 +198,21 @@ Each plan entry contains an editable histogram of context sizes and their relati
 
 **Default distribution:** A new plan entry starts with a single bucket: context size = 500, percentage = 100%, cache hit rate = 0%.
 
+**Context size presets:** The context size input in each bucket is accompanied by a row of 8 clickable preset chips to help a sales engineer reason about realistic workloads. Each chip is labeled with both the token count and a representative use case, and clicking a chip fills the context size input with that value. The user can still enter any custom value directly. The preset spread is:
+
+| Tokens  | Label               | Use case                          |
+|--------:|---------------------|-----------------------------------|
+|     512 | `512 · Short Q&A`   | Single query / FAQ                |
+|   2,048 | `2K · Chat`         | Standard chat turn                |
+|   8,192 | `8K · Support`      | Long chat / support transcript    |
+|  16,384 | `16K · Summarize`   | Document summarization            |
+|  32,768 | `32K · RAG`         | Multi-doc RAG                     |
+| 131,072 | `128K · Book`       | Full book / large codebase        |
+| 204,800 | `200K · Agent`      | Long-context agent (Claude-class) |
+| 1,048,576 | `1M · Repo`       | Frontier long-context (full repo) |
+
+Chips whose value exceeds the model's effective maximum sequence length are rendered disabled (dimmed, not clickable) with a tooltip explaining the limit (e.g., "Exceeds model's 32K context"). This keeps the full spread visible for cross-model comparison while preventing invalid entries.
+
 **Validation rules for the distribution:**
 - The sum of all bucket percentages must equal exactly 100%. The UI displays the current sum and highlights when it does not equal 100%.
 - Each context size must be a positive integer.
