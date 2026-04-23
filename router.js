@@ -5,6 +5,10 @@ const Router = {
     _routes: {},
     _currentCleanup: null,
     _guardActive: false,
+    // Set when we programmatically revert location.hash after the user cancels
+    // the unsaved-changes dialog. Consumed exactly once by the resulting
+    // hashchange event so the dialog doesn't fire a second time.
+    _ignoreNextHashChange: false,
 
     init(routes) {
         this._routes = routes;
@@ -27,6 +31,12 @@ const Router = {
     },
 
     async _onHashChange() {
+        // Swallow the hashchange fired by our own programmatic revert after
+        // the user chose "keep editing" in the unsaved-changes dialog.
+        if (this._ignoreNextHashChange) {
+            this._ignoreNextHashChange = false;
+            return;
+        }
         if (this._guardActive) return;
 
         const hash = location.hash || '#home';
@@ -37,10 +47,10 @@ const Router = {
             const discard = await unsavedChangesDialog();
             this._guardActive = false;
             if (!discard) {
-                // Revert to previous hash without triggering another change
-                this._guardActive = true;
+                // Revert to previous hash. The resulting hashchange will be
+                // consumed by the _ignoreNextHashChange branch above.
+                this._ignoreNextHashChange = true;
                 location.hash = State.getPreviousHash();
-                this._guardActive = false;
                 return;
             }
             State.setDirty(false);
