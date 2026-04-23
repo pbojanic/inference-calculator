@@ -447,6 +447,14 @@ button:disabled {
     cursor: not-allowed;
 }
 
+.gpu-count-display {
+    display: block;
+    margin-top: 2px;
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    white-space: nowrap;
+}
+
 /* ===========================================================================
    References page
    =========================================================================== */

@@ -282,6 +282,15 @@ function renderPlanPage(container) {
                 input.style.borderColor = plan.distribution[i].contextSize > maxCtx ? '#F04E23' : '';
             }
 
+            // Update derived GPU count readout next to Server instances input
+            const tp = (wsEntry.deployment && wsEntry.deployment.tp) || 1;
+            const gpus = plan.serverInstances * tp;
+            if (refs.gpuCountSpan) {
+                refs.gpuCountSpan.textContent = tp > 1
+                    ? `→ ${gpus} GPUs (TP=${tp})`
+                    : `→ ${gpus} GPUs`;
+            }
+
             // Calculate and update results
             let result = null;
             try {
@@ -289,7 +298,7 @@ function renderPlanPage(container) {
             } catch (e) { /* invalid inputs */ }
 
             if (result) {
-                allResults.push({ result, wsEntry });
+                allResults.push({ result, wsEntry, gpus, tp });
                 refs.resultsDiv.innerHTML = `
                     <div class="plan-result-row">
                         <span class="plan-result-label">KV Cache Size:</span>
@@ -316,8 +325,13 @@ function renderPlanPage(container) {
             const results = allResults.map(r => r.result);
             if (results.length > 0) {
                 const rollup = calculatePlanRollup(results);
+                const totalGpus = allResults.reduce((s, r) => s + r.gpus, 0);
                 let rollupHTML = `
                     <h2 style="margin-top: 0;">Aggregate</h2>
+                    <div class="plan-result-row">
+                        <span class="plan-result-label">Total GPUs:</span>
+                        <span class="plan-result-value">${totalGpus}</span>
+                    </div>
                     <div class="plan-result-row">
                         <span class="plan-result-label">Total KV Cache Size:</span>
                         <span class="plan-result-value">${formatSizeHuman(rollup.totalKVSizeBytes)}</span>
@@ -375,9 +389,13 @@ function renderPlanPage(container) {
         const inputRow = document.createElement('div');
         inputRow.className = 'plan-inputs-row';
 
-        inputRow.appendChild(buildNumberField('Server instances', plan.serverInstances, 1, null, true, v => {
+        const serverInstancesField = buildNumberField('Server instances', plan.serverInstances, 1, null, true, v => {
             plan.serverInstances = v; markDirty(); scheduleRecalc();
-        }));
+        });
+        const gpuCountSpan = document.createElement('span');
+        gpuCountSpan.className = 'gpu-count-display';
+        serverInstancesField.appendChild(gpuCountSpan);
+        inputRow.appendChild(serverInstancesField);
         inputRow.appendChild(buildNumberField('Total users', plan.totalUsers, 1, null, true, v => {
             plan.totalUsers = v; markDirty(); scheduleRecalc();
         }));
@@ -473,7 +491,7 @@ function renderPlanPage(container) {
         card.appendChild(detailsDiv);
 
         // Store stable output references
-        cardOutputs[wsEntry.id] = { resultsDiv, errorsDiv, detailsDiv, pctSumCell, kvCells, ctxInputs };
+        cardOutputs[wsEntry.id] = { resultsDiv, errorsDiv, detailsDiv, pctSumCell, kvCells, ctxInputs, gpuCountSpan };
 
         return card;
     }
@@ -639,9 +657,10 @@ function renderPlanPage(container) {
     function buildRollupDetailHTML(allResults) {
         const lines = [];
         lines.push('<h3 style="margin-top: 10px;">Per-Model Breakdown</h3>');
-        lines.push('<table class="plan-detail-table"><thead><tr><th>Model</th><th>KV Cache Size</th><th>Write</th><th>Read</th></tr></thead><tbody>');
-        for (const { result, wsEntry } of allResults) {
-            lines.push(`<tr><td>${wsEntry.title}</td><td>${formatSizeHuman(result.totalKVSizeBytes)}</td><td>${formatThroughputHuman(result.totalWriteGiBps)}</td><td>${formatThroughputHuman(result.totalReadGiBps)}</td></tr>`);
+        lines.push('<table class="plan-detail-table"><thead><tr><th>Model</th><th>GPUs</th><th>KV Cache Size</th><th>Write</th><th>Read</th></tr></thead><tbody>');
+        for (const { result, wsEntry, gpus, tp } of allResults) {
+            const gpuCell = tp > 1 ? `${gpus} (TP=${tp})` : `${gpus}`;
+            lines.push(`<tr><td>${wsEntry.title}</td><td>${gpuCell}</td><td>${formatSizeHuman(result.totalKVSizeBytes)}</td><td>${formatThroughputHuman(result.totalWriteGiBps)}</td><td>${formatThroughputHuman(result.totalReadGiBps)}</td></tr>`);
         }
         lines.push('</tbody></table>');
         return lines.join('');

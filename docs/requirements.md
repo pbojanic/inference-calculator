@@ -214,6 +214,13 @@ Each plan entry has the following editable fields:
 - **Concurrent users** (positive integer, default 10) — the number of users actively using the model at any given moment. Must be less than or equal to total users.
 - **Stored exchanges per user** (positive integer, default 50) — the number of distinct input contexts (exchanges) stored per user. For chat applications this might be ~50; for coding agents ~200. This drives the size calculation.
 - **Exchange rate per hour** (positive number, default 10) — the number of new exchanges generated per concurrent user per hour. This drives the throughput calculation.
+- **Derived GPU count** — Each plan entry displays the total number of GPUs the planned deployment represents, calculated as:
+
+  ```
+  gpus = serverInstances × deployment.tp
+  ```
+
+  where `deployment.tp` is the tensor-parallel value configured on the model's Model Details page (default 1). The derived value is shown inline next to the Server instances input as muted read-only text (e.g. `→ 80 GPUs (TP=8)`), and updates automatically whenever the server-instance count changes on the Plan page or the tensor-parallel setting is changed on the Model Details page. The value is read-only — it can only be influenced by editing its two inputs. For models deployed at TP=1, the readout shows just the GPU count (e.g. `→ 1 GPUs`).
 
 ### Input token distribution
 
@@ -306,6 +313,7 @@ total_read_GiBps  = Σ read_throughput across all buckets / (1024³)
 
 Below all model entries, display an aggregate summary:
 
+- **Total GPUs** — sum of `serverInstances × deployment.tp` across all plan entries. Represents the total GPU footprint of the planned deployment. Shown alongside the existing aggregate KV-cache-size and throughput figures.
 - **Total KV cache size** — sum of all models' KV cache sizes
 - **Total write throughput** — sum of all models' write throughput (GiB/s)
 - **Total read throughput** — sum of all models' read throughput (GiB/s)
@@ -318,7 +326,7 @@ A "Show calculation details" checkbox appears between the model cards and the ro
 - **KV Cache Size breakdown**: the total exchange count (total users x exchanges/user), then a table showing each distribution bucket's context size, percentage, number of exchanges, KV cache per sequence, and size subtotal. Summarized with the total.
 - **Throughput breakdown**: the aggregate exchange rate (server instances x concurrent users x rate/hr), then a table showing each bucket's context size, percentage, cache hit rate, write throughput, and read throughput. Summarized with totals.
 
-**Roll-up details** show a per-model summary table with each model's KV cache size, write throughput, and read throughput.
+**Roll-up details** show a per-model summary table with each model's GPU count (`serverInstances × deployment.tp`), KV cache size, write throughput, and read throughput.
 
 These details stay at a high level (KV cache sizes, exchange counts, throughput rates) and do not replicate model architecture details available on the Model Details page.
 
