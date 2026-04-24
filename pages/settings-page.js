@@ -119,8 +119,9 @@ function renderSettingsPage(container) {
             const json = JSON.stringify(data, null, 2);
             const suggestedName = `inference-calculator-backup-${new Date().toISOString().slice(0, 10)}.json`;
 
-            // Prefer the File System Access API so the user gets a native
-            // "Save As" dialog and can choose the location and filename.
+            // Preferred path: native OS Save As dialog via the File System
+            // Access API. Only available in Chromium browsers AND requires a
+            // secure context — it often fails on file:// origins.
             if (typeof window.showSaveFilePicker === 'function') {
                 try {
                     const handle = await window.showSaveFilePicker({
@@ -135,27 +136,39 @@ function renderSettingsPage(container) {
                     await writable.close();
                     status.textContent = 'Data exported.';
                     status.className = 'status-ok';
+                    setTimeout(() => status.textContent = '', 2000);
+                    return;
                 } catch (err) {
-                    // User dismissed the dialog — no status update needed.
+                    // User dismissed the native picker — stop silently.
                     if (err && err.name === 'AbortError') return;
-                    status.textContent = `Export failed: ${err.message || err}`;
-                    status.className = 'status-err';
+                    // API is present but failed (e.g., SecurityError on a
+                    // file:// origin). Log and fall through to the prompt-
+                    // based fallback so the user still gets a prompt.
+                    console.warn('showSaveFilePicker failed, using prompt fallback:', err);
                 }
-            } else {
-                // Fallback for browsers without the File System Access API
-                // (Firefox, Safari). The file downloads to the browser's
-                // default location without a picker.
-                const blob = new Blob([json], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = suggestedName;
-                a.click();
-                URL.revokeObjectURL(url);
-                status.textContent = 'Data exported.';
-                status.className = 'status-ok';
             }
-            setTimeout(() => status.textContent = '', 2000);
+
+            // Fallback: the browser either doesn't support showSaveFilePicker
+            // (Safari, Firefox) or blocked it (file:// origin). Show our own
+            // filename prompt so the user is never surprised by a silent
+            // download.
+            const filename = await promptDialog(
+                'Save exported data as (file will be saved to your browser\'s default Downloads folder):',
+                suggestedName,
+                'Download'
+            );
+            if (filename === null) return; // cancelled
+
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = (filename.trim() || suggestedName);
+            a.click();
+            URL.revokeObjectURL(url);
+            status.textContent = `Exported as ${a.download}.`;
+            status.className = 'status-ok';
+            setTimeout(() => status.textContent = '', 3000);
         };
 
         const importBtn = document.createElement('button');

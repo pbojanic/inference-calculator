@@ -57,7 +57,12 @@ The HuggingFace token is entered on the Settings page. Settings save automatical
 
 The Settings page includes Export and Import buttons for backing up and restoring all application data.
 
-**Export** prompts the user with a standard Save As dialog (via the browser's File System Access API where available) so they can choose the destination folder and filename. The suggested filename is `inference-calculator-backup-YYYY-MM-DD.json`. The exported JSON contains the workspace (working models with their configs and deployment settings), GPU profiles, cached model configs, and plan data. The HuggingFace token is excluded from the export for security. In browsers without the File System Access API (Firefox, Safari), the export falls back to a standard anchor-based download that goes to the browser's default download folder with the same suggested filename.
+**Export** always prompts the user before saving — the user never sees a silent download. Two paths, chosen at runtime:
+
+1. **Native Save As dialog** (preferred) — when the browser supports the File System Access API and the page is in a compatible context (Chromium browsers on HTTPS or localhost), clicking Export opens the OS's native Save As dialog so the user can pick both the folder and the filename. The suggested filename is `inference-calculator-backup-YYYY-MM-DD.json`.
+2. **Filename prompt fallback** — when the File System Access API is unavailable (Safari, Firefox) or blocked (Chromium on a `file://` origin), the app shows its own modal prompting the user to confirm or edit the filename before triggering a standard anchor-based download. The file then lands in the browser's default Downloads folder. The modal uses the same overlay pattern as `confirmDialog` and the unsaved-changes guard.
+
+The exported JSON contains the workspace (working models with their configs and deployment settings), GPU profiles, cached model configs, and plan data. The HuggingFace token is excluded from the export for security. If the user cancels either dialog, nothing is saved and no status message is shown.
 
 **Import** loads a previously exported JSON file and replaces the current workspace, GPU profiles, cached model configs, and plan data. The HuggingFace token is not affected by import. The application should confirm before importing since it replaces existing data.
 
