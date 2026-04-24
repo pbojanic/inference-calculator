@@ -108,7 +108,7 @@ function renderSettingsPage(container) {
         const exportBtn = document.createElement('button');
         exportBtn.className = 'btn-secondary btn-small';
         exportBtn.textContent = 'Export';
-        exportBtn.onclick = () => {
+        exportBtn.onclick = async () => {
             const data = {
                 version: 1,
                 workspace: JSON.parse(localStorage.getItem(LS_WORKSPACE_KEY) || '{}'),
@@ -116,15 +116,45 @@ function renderSettingsPage(container) {
                 models: JSON.parse(localStorage.getItem(LS_MODELS_KEY) || '{}'),
                 plan: JSON.parse(localStorage.getItem(LS_PLAN_KEY) || '{}')
             };
-            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `inference-calculator-backup-${new Date().toISOString().slice(0, 10)}.json`;
-            a.click();
-            URL.revokeObjectURL(url);
-            status.textContent = 'Data exported.';
-            status.className = 'status-ok';
+            const json = JSON.stringify(data, null, 2);
+            const suggestedName = `inference-calculator-backup-${new Date().toISOString().slice(0, 10)}.json`;
+
+            // Prefer the File System Access API so the user gets a native
+            // "Save As" dialog and can choose the location and filename.
+            if (typeof window.showSaveFilePicker === 'function') {
+                try {
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName,
+                        types: [{
+                            description: 'JSON file',
+                            accept: { 'application/json': ['.json'] }
+                        }]
+                    });
+                    const writable = await handle.createWritable();
+                    await writable.write(json);
+                    await writable.close();
+                    status.textContent = 'Data exported.';
+                    status.className = 'status-ok';
+                } catch (err) {
+                    // User dismissed the dialog — no status update needed.
+                    if (err && err.name === 'AbortError') return;
+                    status.textContent = `Export failed: ${err.message || err}`;
+                    status.className = 'status-err';
+                }
+            } else {
+                // Fallback for browsers without the File System Access API
+                // (Firefox, Safari). The file downloads to the browser's
+                // default location without a picker.
+                const blob = new Blob([json], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = suggestedName;
+                a.click();
+                URL.revokeObjectURL(url);
+                status.textContent = 'Data exported.';
+                status.className = 'status-ok';
+            }
             setTimeout(() => status.textContent = '', 2000);
         };
 

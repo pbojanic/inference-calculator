@@ -57,7 +57,7 @@ The HuggingFace token is entered on the Settings page. Settings save automatical
 
 The Settings page includes Export and Import buttons for backing up and restoring all application data.
 
-**Export** saves a JSON file containing the workspace (working models with their configs and deployment settings), GPU profiles, cached model configs, and plan data. The HuggingFace token is excluded from the export for security.
+**Export** prompts the user with a standard Save As dialog (via the browser's File System Access API where available) so they can choose the destination folder and filename. The suggested filename is `inference-calculator-backup-YYYY-MM-DD.json`. The exported JSON contains the workspace (working models with their configs and deployment settings), GPU profiles, cached model configs, and plan data. The HuggingFace token is excluded from the export for security. In browsers without the File System Access API (Firefox, Safari), the export falls back to a standard anchor-based download that goes to the browser's default download folder with the same suggested filename.
 
 **Import** loads a previously exported JSON file and replaces the current workspace, GPU profiles, cached model configs, and plan data. The HuggingFace token is not affected by import. The application should confirm before importing since it replaces existing data.
 
