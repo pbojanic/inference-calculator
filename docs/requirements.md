@@ -212,10 +212,10 @@ The Plan page displays one row per workspace model, identified by the model's ti
 Each plan entry has the following editable fields:
 
 - **Server instances** (positive integer, default 1) — the number of inference server instances running this model. This equals total GPUs divided by the model's tensor parallelism setting. More instances means more IO to the shared storage.
-- **Total users** (*triple*: low / expected / high, each a positive integer; expected default 100) — the total number of users who have stored KV caches for this model. The Plan page's headline KV-cache and throughput calculations use the **Expected** value. Low and High values are only consulted by the Graphs page.
-- **Concurrent users** (*triple*: low / expected / high, each a positive integer; expected default 10) — the number of users actively using the model at any given moment. Must be less than or equal to total users (Expected). The Plan page's headline KV-cache and throughput calculations use the **Expected** value. Low and High values are only consulted by the Graphs page. Default values for Low and High are equal to Expected (i.e. no uncertainty until the user widens the range).
-- **Stored exchanges per user** (*triple*: low / expected / high, each a positive integer; expected default 50) — the number of distinct input contexts (exchanges) stored per user. For chat applications this might be ~50; for coding agents ~200. This drives the size calculation. Same Expected-drives-Plan-page, triple-drives-Graphs rule applies.
-- **Exchange rate per hour** (*triple*: low / expected / high, each a positive number; expected default 10) — the number of new exchanges generated per concurrent user per hour. Same Expected-drives-Plan-page, triple-drives-Graphs rule applies.
+- **Total users** (*range*: low / high, each a positive integer; default low = high = 100) — the total number of users who have stored KV caches for this model. Every downstream number that depends on total users is computed as a range (a Low result and a High result) and displayed across the app as `Low – High`.
+- **Concurrent users** (*range*: low / high, each a positive integer; default low = high = 10) — the number of users actively using the model at any given moment. Both bounds must be ≤ the corresponding Total users bound (`concurrentUsersLow ≤ totalUsersLow`, `concurrentUsersHigh ≤ totalUsersHigh`).
+- **Stored exchanges per user** (*range*: low / high, each a positive integer; default low = high = 50) — the number of distinct input contexts (exchanges) stored per user. For chat applications this might be ~50; for coding agents ~200. Drives the size calculation.
+- **Exchange rate per hour** (*range*: low / high, each a positive number; default low = high = 10) — the number of new exchanges generated per concurrent user per hour. Drives the throughput calculation.
 - **Derived GPU count** — Each plan entry displays the total number of GPUs the planned deployment represents, calculated as:
 
   ```
@@ -224,7 +224,7 @@ Each plan entry has the following editable fields:
 
   where `deployment.tp` is the tensor-parallel value configured on the model's Model Details page (default 1). The derived value is shown inline next to the Server instances input as muted read-only text (e.g. `→ 80 GPUs (TP=8)`), and updates automatically whenever the server-instance count changes on the Plan page or the tensor-parallel setting is changed on the Model Details page. The value is read-only — it can only be influenced by editing its two inputs. For models deployed at TP=1, the readout shows just the GPU count (e.g. `→ 1 GPUs`).
 
-**Scenario triples** — Selected fuzzy inputs (*Total users*, *Concurrent users*, *Stored exchanges per user*, *Exchange rate per hour*) are captured as `{low, expected, high}` triples rather than single numbers. The Plan page's headline computations and the Calculation details view continue to use only the Expected value, preserving current behavior. The Graphs page consumes the triples to render range bars for capacity and throughput. Validation: `low ≤ expected ≤ high` for each triple, all values positive.
+**Scenario ranges** — The fuzzy inputs listed above (*Total users*, *Concurrent users*, *Stored exchanges per user*, *Exchange rate per hour*) are captured as `{low, high}` ranges rather than single numbers. Per-bucket distribution values (context size, percentage, cache hit rate) remain single numbers because they describe workload shape, not scale uncertainty. Every computed quantity that depends on a range (KV cache size, throughput, roll-ups, Graphs-page bars) is also a range: the Low case substitutes every `*Low` value, the High case substitutes every `*High` value, and the output is reported as `Low – High`. Validation: `low ≤ high` for each range, all values positive; the concurrent-users range is also bounded by the total-users range at each end.
 
 ### Input token distribution
 
@@ -263,94 +263,88 @@ The user can add and remove distribution buckets via an "Add Bucket" button and 
 
 ### KV cache size calculation
 
-KV cache size represents the total storage required on the shared storage system to hold all cached contexts. It is based on **total users** (not concurrent), because every user's context must be stored regardless of whether they are active.
-
-For a single bucket with context size `C` and percentage `P`:
+KV cache size is reported as a **range**. The Low bound substitutes `totalUsersLow` and `exchangesPerUserLow`; the High bound substitutes `totalUsersHigh` and `exchangesPerUserHigh`. Both bounds are computed the same way:
 
 ```
 kv_bytes_per_sequence = calculateKVCacheMemory(config, maxNumSeqs=1, promptLength=C, tensorParallel=1, bytesPerKV)
-```
 
-This uses the existing KV cache calculation with tensor parallelism = 1 to get the aggregate (not per-rank) cache size per sequence.
-
-Total KV cache size for the model:
-
-```
-total_kv_size = Σ over all buckets:
-    totalUsers × exchangesPerUser × (percentage / 100) × kv_bytes_per_sequence(contextSize)
+total_kv_size_{bound} = Σ over all buckets:
+    totalUsers_{bound} × exchangesPerUser_{bound} × (percentage / 100) × kv_bytes_per_sequence(contextSize)
 ```
 
 - Based on **total users** — all contexts are stored
 - **NOT** multiplied by server instances — shared storage holds one copy
 - Cache hit rates do **not** affect the size calculation
 
-Display in human-readable units (GiB or TiB as appropriate).
+Display in human-readable units (GiB or TiB as appropriate) as `Low – High`, e.g. `60 GiB – 240 GiB`.
 
 ### KV cache throughput calculation
 
-Throughput represents the rate of IO operations (reads and writes) to the shared storage system, in GiB/s. It is based on **concurrent users** and **server instances**.
+Throughput is reported as a **range**. The Low bound substitutes `concurrentUsersLow` and `exchangeRatePerHourLow`; the High bound substitutes `concurrentUsersHigh` and `exchangeRatePerHourHigh`. Per-bucket cache hit rates are not part of the range (they describe workload shape, not uncertainty).
 
-For each bucket:
-
-```
-exchange_rate_per_second = exchangeRatePerHour / 3600
-
-bucket_exchanges_per_second = serverInstances × concurrentUsers × exchange_rate_per_second × (percentage / 100)
-
-write_throughput = bucket_exchanges_per_second × (1 - cacheHitRate / 100) × kv_bytes_per_sequence(contextSize)
-read_throughput  = bucket_exchanges_per_second × (cacheHitRate / 100) × kv_bytes_per_sequence(contextSize)
-```
-
-Total throughput for the model:
+For each bucket and each bound:
 
 ```
-total_write_GiBps = Σ write_throughput across all buckets / (1024³)
-total_read_GiBps  = Σ read_throughput across all buckets / (1024³)
+exchange_rate_per_second_{bound} = exchangeRatePerHour_{bound} / 3600
+
+bucket_exchanges_per_second_{bound} = serverInstances × concurrentUsers_{bound} × exchange_rate_per_second_{bound} × (percentage / 100)
+
+write_throughput_{bound} = bucket_exchanges_per_second_{bound} × (1 − cacheHitRate / 100) × kv_bytes_per_sequence(contextSize)
+read_throughput_{bound}  = bucket_exchanges_per_second_{bound} × (cacheHitRate / 100)     × kv_bytes_per_sequence(contextSize)
+```
+
+Total throughput range for the model:
+
+```
+total_write_GiBps_{bound} = Σ write_throughput_{bound} across all buckets / (1024³)
+total_read_GiBps_{bound}  = Σ read_throughput_{bound}  across all buckets / (1024³)
 ```
 
 - Based on **concurrent users** — only active users generate IO
 - **Multiplied by server instances** — each instance generates IO to the shared storage independently
 - Cache misses produce **writes**; cache hits produce **reads**
-- Display in GiB/s
+- Display each output as a `Low – High` range in GiB/s
 
 ### Roll-up summary
 
 Below all model entries, display an aggregate summary:
 
-- **Total GPUs** — sum of `serverInstances × deployment.tp` across all plan entries. Represents the total GPU footprint of the planned deployment. Shown alongside the existing aggregate KV-cache-size and throughput figures.
-- **Total KV cache size** — sum of all models' KV cache sizes
-- **Total write throughput** — sum of all models' write throughput (GiB/s)
-- **Total read throughput** — sum of all models' read throughput (GiB/s)
+- **Total GPUs** — sum of `serverInstances × deployment.tp` across all plan entries. A single number (not a range) because neither factor is a range input.
+- **Total KV cache size** — sum of each model's Low into an aggregate Low, sum of each model's High into an aggregate High. Displayed as `Low – High`.
+- **Total write throughput** — per-bound sum across all models, displayed as `Low – High`.
+- **Total read throughput** — per-bound sum across all models, displayed as `Low – High`.
 
 ### Calculation details toggle
 
-A "Show calculation details" checkbox appears between the model cards and the roll-up summary. When enabled, each model card and the roll-up display additional detail breakdowns intended to let a reader (typically a sales engineer in conversation with a customer) audit every headline KV-cache and throughput number back to the inputs that produced it. The breakdowns deliberately do not re-derive architectural details (number of layers, heads, etc.) — those live on the Model Details page. The reader is assumed to trust the per-sequence KV cache size for each model and to be auditing only how the plan inputs compose into the aggregate.
+A "Show calculation details" checkbox appears between the model cards and the roll-up summary. When enabled, each model card and the roll-up display additional detail breakdowns intended to let a reader (typically a sales engineer in conversation with a customer) audit every headline KV-cache and throughput range back to the inputs that produced it. The breakdowns deliberately do not re-derive architectural details (number of layers, heads, etc.) — those live on the Model Details page. The reader is assumed to trust the per-sequence KV cache size for each model and to be auditing only how the plan inputs compose into the aggregate.
+
+Because every headline number is a range, the details views render the Low and High cases in parallel: one line for each bound in the preambles, and range cells (`Low – High`) in the bucket tables.
 
 **Per-model details** show, in this order:
 
-1. **KV cache size derivation** — a three-line preamble written out with the actual plan inputs substituted:
+1. **KV cache size derivation** — a preamble that substitutes each bound's inputs explicitly:
 
    ```
-   total_exchanges = totalUsers × exchangesPerUser
-                   = 100 × 50
-                   = 5,000 stored exchanges
+   total_exchanges_low  = totalUsersLow  × exchangesPerUserLow  =  50 ×  25 = 1,250  stored exchanges
+   total_exchanges_high = totalUsersHigh × exchangesPerUserHigh = 200 × 100 = 20,000 stored exchanges
    ```
 
-   followed by the per-bucket table with columns: context size, percentage, exchanges, KV cache per sequence, size subtotal. A summary row shows the model's total.
+   followed by the per-bucket table with columns: context size, percentage, **exchanges** (range), KV cache per sequence, **size subtotal** (range). A summary row shows the model's total KV cache size as a range.
 
-2. **Throughput derivation** — a three-line preamble showing the per-second conversion with substituted values:
+2. **Throughput derivation** — a preamble that substitutes each bound's inputs explicitly:
 
    ```
-   aggregate_exchanges_per_sec = serverInstances × concurrentUsers × exchangeRatePerHour ÷ 3600
-                               = 10 × 10 × 10 ÷ 3600
-                               = 0.278 exchanges/sec
+   aggregate_exchanges_per_sec_low  = serverInstances × concurrentUsersLow  × exchangeRatePerHourLow  ÷ 3600
+                                    = 1 × 5  × 5  ÷ 3600 = 0.007  exchanges/sec
+   aggregate_exchanges_per_sec_high = serverInstances × concurrentUsersHigh × exchangeRatePerHourHigh ÷ 3600
+                                    = 1 × 20 × 20 ÷ 3600 = 0.111  exchanges/sec
    ```
 
-   followed by the per-bucket table with columns: context size, percentage, **exchanges/sec**, cache hit rate, **hits/sec**, **misses/sec**, write GiB/s, read GiB/s. The hits/misses columns make the cache-hit mechanism explicit — misses drive writes, hits drive reads — rather than leaving the reader to infer the split from the headline write/read values. A summary row shows totals.
+   followed by the per-bucket table with columns: context size, percentage, **exchanges/sec** (range), cache hit rate, **hits/sec** (range), **misses/sec** (range), **write GiB/s** (range), **read GiB/s** (range). A summary row shows totals as ranges.
 
-Every formula preamble uses the three-line symbolic → substituted → result form so a customer reading over the sales engineer's shoulder can reproduce the math step by step.
+Every preamble writes out the formula once per bound (Low and High) so a customer reading over the sales engineer's shoulder can reproduce both extremes.
 
-**Roll-up details** show a per-model summary table with each model's GPU count (`serverInstances × deployment.tp`), KV cache size, write throughput, and read throughput. Totals appear in a summary row.
+**Roll-up details** show a per-model summary table with each model's GPU count (single number), KV cache size (range), write throughput (range), and read throughput (range). Totals appear in a summary row.
 
 ### Auto-calculation
 
@@ -387,45 +381,40 @@ Below the per-model cards, a final **Aggregate** card rolls up all workspace mod
 
 Every chart on the Graphs page uses the same horizontal range-bar idiom:
 
-- **Chart type:** horizontal floating-bar (range bar) with `data = [[min, max]]`.
-- **x-axis:** GiB for capacity charts, GiB/s for throughput charts. Starts at 0; upper bound `1.15 × Max` for headroom.
-- **Bar:** spans from Min to Max, semi-transparent in the accent color.
-- **Expected marker:** a solid vertical tick across the bar at the Expected value, rendered slightly darker than the bar fill.
-- **Summary line:** one centered text line directly beneath the bar in the form `Min 0.12 · Expected 0.24 · Max 0.36` (values formatted via `formatSizeHuman` for capacity or `formatThroughputHuman` for throughput). The summary always renders at a fixed centered position and never tries to anchor labels to individual x-axis positions — this keeps the chart readable when the range is narrow.
-- **No-uncertainty fallback:** when Min = Expected = Max the range-bar would have zero width. A minimum visible width (~2% of the x-axis) is drawn around the Expected value so the chart never looks blank.
+- **Chart type:** horizontal floating-bar with `data = [[low, high]]`.
+- **x-axis:** GiB for capacity charts, GiB/s for throughput charts. Starts at 0; upper bound `1.15 × High` for headroom.
+- **Bar:** spans from Low to High, semi-transparent in the accent color.
+- **Summary line:** one centered text line directly beneath the bar in the form `Low 0.12 · High 0.36` (values formatted via `formatSizeHuman` for capacity or `formatThroughputHuman` for throughput). The summary always renders at a fixed centered position — readable regardless of how narrow the range is.
+- **No-range fallback:** when Low = High the floating bar would have zero width. A minimum visible width (~2% of the x-axis) is drawn centered on the Low = High value so the chart is never blank.
 
 ### Per-model: Capacity
 
-The capacity chart answers "given my adoption and behavior assumptions, how much KV cache storage do I need to provision for this model?"
+The capacity chart shows the range of KV cache storage needed for this model, driven by the `totalUsers` and `exchangesPerUser` ranges.
 
-- **Min** — `calculatePlanEntry` with `totalUsers = totalUsersLow` and `exchangesPerUser = exchangesPerUserLow`; all other inputs (including `concurrentUsers` and `exchangeRatePerHour`) at their Expected values.
-- **Expected** — matches the Plan page's headline KV cache size for this model.
-- **Max** — as Min but with both triples at their High values.
-- **Chart title:** `Capacity — storage for {N} total users × {M} exchanges/user (Expected)`.
-- **Rationale for using both-low / both-high:** `totalUsers` and `exchangesPerUser` multiply in the capacity formula; using both at the extreme gives the correct interval-arithmetic bound. The `concurrentUsers` and `exchangeRatePerHour` triples are irrelevant to capacity and are not consulted for this chart.
+- **Low** — `calculatePlanEntry` with `totalUsers = totalUsersLow`, `exchangesPerUser = exchangesPerUserLow`; other range inputs (concurrent users, exchange rate per hour) substitute their Low values, but those don't affect capacity anyway.
+- **High** — same structure, all `*High` values.
+- **Chart title:** `Capacity`.
 
 ### Per-model: Throughput (Write and Read)
 
-The throughput charts answer "at this customer's stated concurrency, what range of throughput do I need to provision?" The concurrent-user count is **held fixed at the Plan-page Expected value**. Uncertainty comes only from the `exchangeRatePerHour` triple.
+The throughput charts show the range of read/write throughput driven by both the `concurrentUsers` and `exchangeRatePerHour` ranges. The Low bound uses both at their Low value; the High bound uses both at their High value. Per-bucket cache hit rates are not ranged.
 
-- **Min** — `calculatePlanEntry` with `concurrentUsers = plan.concurrentUsers` (Expected), `exchangeRatePerHour = exchangeRatePerHourLow`, per-bucket `cacheHitRate` unchanged.
-- **Expected** — same, with `exchangeRatePerHour = exchangeRatePerHour`. Matches the Plan-page headline throughput.
-- **Max** — same, with `exchangeRatePerHour = exchangeRatePerHourHigh`.
-- **Chart title:** `Write throughput — at N concurrent users` or `Read throughput — at N concurrent users`.
-- The `concurrentUsers`, `totalUsers`, and `exchangesPerUser` triples' Low/High values are not consulted for the throughput charts.
+- **Low** — `calculatePlanEntry` with `concurrentUsers = concurrentUsersLow`, `exchangeRatePerHour = exchangeRatePerHourLow`.
+- **High** — same with `*High` values.
+- **Chart titles:** `Write throughput`, `Read throughput`.
 
 ### Aggregate card
 
-A single card at the bottom of the page, rolling up all workspace models. Three stacked range-bar charts with the same form as the per-model card:
+A single card at the bottom of the page, rolling up all workspace models. Three stacked range bars with the same form as the per-model card:
 
-- **Total capacity** — per-bound sum across all models: `totalMin = Σ model.capacityMin`, `totalExpected = Σ model.capacityExpected`, `totalMax = Σ model.capacityMax`. The Expected value matches the existing Plan-page Aggregate `Total KV cache size`.
+- **Total capacity** — per-bound sum across all models: `totalLow = Σ model.capacityLow`, `totalHigh = Σ model.capacityHigh`. Matches the Plan-page Aggregate `Total KV cache size` range exactly.
 - **Total write throughput** — per-bound sum of per-model write throughput values.
 - **Total read throughput** — per-bound sum of per-model read throughput values.
 
-Sums are performed in the bound direction (low-with-low, expected-with-expected, high-with-high). This implicitly assumes each model's uncertainty is perfectly correlated with the others (e.g., if adoption is low for one it is low for all) — a deliberately conservative-but-wide bound appropriate for sales-conversation "what-if" framing.
+Sums are performed in the bound direction (low-with-low, high-with-high). This implicitly assumes each model's uncertainty is perfectly correlated with the others — a deliberately conservative-but-wide bound appropriate for sales-conversation "what-if" framing.
 
 ### Empty and edge states
 
-- **No workspace models:** page shows empty state directing the user to the Home page to add a model. No per-model cards and no aggregate card are rendered.
+- **No workspace models:** page shows empty state directing the user to the Home page to add a model.
 - **No plan data for a model:** that per-model card shows an empty state directing the user to the Plan page; the model is excluded from the aggregate roll-up.
-- **All triples flat (no uncertainty):** range bars collapse to their minimum visible width; the Expected marker is still drawn so the Expected value remains visible and readable.
+- **No range (Low = High):** range bars collapse to their minimum visible width; the summary line continues to show `Low X · High X` so the value is readable.

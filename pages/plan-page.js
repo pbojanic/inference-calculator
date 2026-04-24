@@ -38,16 +38,12 @@ function defaultPlanEntry(workspaceId) {
     return {
         workspaceId,
         serverInstances: 1,
-        totalUsers: 100,
         totalUsersLow: 100,
         totalUsersHigh: 100,
-        concurrentUsers: 10,
         concurrentUsersLow: 10,
         concurrentUsersHigh: 10,
-        exchangesPerUser: 50,
         exchangesPerUserLow: 50,
         exchangesPerUserHigh: 50,
-        exchangeRatePerHour: 10,
         exchangeRatePerHourLow: 10,
         exchangeRatePerHourHigh: 10,
         distribution: [
@@ -74,17 +70,23 @@ function syncPlanWithWorkspace() {
         }
     }
 
-    // Migrate older plans that predate scenario triples: seed low/high from the
-    // existing point estimate so they start with no uncertainty.
+    // Migrate older plans. Two historical shapes are possible:
+    //   1. Single point estimate per input (pre-triples): seed low and high to the point.
+    //   2. Triple {low, expected, high}: keep low/high and drop the Expected field.
+    // After migration only `*Low` and `*High` fields remain.
     for (const plan of Object.values(store)) {
-        if (plan.totalUsersLow === undefined) plan.totalUsersLow = plan.totalUsers;
-        if (plan.totalUsersHigh === undefined) plan.totalUsersHigh = plan.totalUsers;
-        if (plan.concurrentUsersLow === undefined) plan.concurrentUsersLow = plan.concurrentUsers;
-        if (plan.concurrentUsersHigh === undefined) plan.concurrentUsersHigh = plan.concurrentUsers;
-        if (plan.exchangesPerUserLow === undefined) plan.exchangesPerUserLow = plan.exchangesPerUser;
-        if (plan.exchangesPerUserHigh === undefined) plan.exchangesPerUserHigh = plan.exchangesPerUser;
-        if (plan.exchangeRatePerHourLow === undefined) plan.exchangeRatePerHourLow = plan.exchangeRatePerHour;
-        if (plan.exchangeRatePerHourHigh === undefined) plan.exchangeRatePerHourHigh = plan.exchangeRatePerHour;
+        if (plan.totalUsersLow === undefined) plan.totalUsersLow = plan.totalUsers ?? 100;
+        if (plan.totalUsersHigh === undefined) plan.totalUsersHigh = plan.totalUsers ?? 100;
+        if (plan.concurrentUsersLow === undefined) plan.concurrentUsersLow = plan.concurrentUsers ?? 10;
+        if (plan.concurrentUsersHigh === undefined) plan.concurrentUsersHigh = plan.concurrentUsers ?? 10;
+        if (plan.exchangesPerUserLow === undefined) plan.exchangesPerUserLow = plan.exchangesPerUser ?? 50;
+        if (plan.exchangesPerUserHigh === undefined) plan.exchangesPerUserHigh = plan.exchangesPerUser ?? 50;
+        if (plan.exchangeRatePerHourLow === undefined) plan.exchangeRatePerHourLow = plan.exchangeRatePerHour ?? 10;
+        if (plan.exchangeRatePerHourHigh === undefined) plan.exchangeRatePerHourHigh = plan.exchangeRatePerHour ?? 10;
+        delete plan.totalUsers;
+        delete plan.concurrentUsers;
+        delete plan.exchangesPerUser;
+        delete plan.exchangeRatePerHour;
     }
 
     _savePlanStore(store);
@@ -105,42 +107,39 @@ function validatePlanEntry(plan, maxContext) {
 
     if (!Number.isInteger(plan.serverInstances) || plan.serverInstances < 1)
         errors.push('Server instances must be at least 1');
-    if (!Number.isInteger(plan.totalUsers) || plan.totalUsers < 1)
-        errors.push('Total users must be at least 1');
-    if (!Number.isInteger(plan.concurrentUsers) || plan.concurrentUsers < 1)
-        errors.push('Concurrent users must be at least 1');
-    if (plan.concurrentUsers > plan.totalUsers)
-        errors.push('Concurrent users cannot exceed total users');
-    if (!Number.isInteger(plan.exchangesPerUser) || plan.exchangesPerUser < 1)
-        errors.push('Exchanges per user must be at least 1');
-    if (typeof plan.exchangeRatePerHour !== 'number' || plan.exchangeRatePerHour <= 0)
-        errors.push('Exchange rate must be greater than 0');
 
-    // Scenario-triple validation
+    // Scenario-range validation: each fuzzy input is a {low, high} pair.
     if (!Number.isInteger(plan.totalUsersLow) || plan.totalUsersLow < 1)
         errors.push('Total users (low) must be a positive integer');
     if (!Number.isInteger(plan.totalUsersHigh) || plan.totalUsersHigh < 1)
         errors.push('Total users (high) must be a positive integer');
-    if (plan.totalUsersLow > plan.totalUsers || plan.totalUsers > plan.totalUsersHigh)
-        errors.push('Total users must satisfy low ≤ expected ≤ high');
+    if (plan.totalUsersLow > plan.totalUsersHigh)
+        errors.push('Total users: low must not exceed high');
+
     if (!Number.isInteger(plan.concurrentUsersLow) || plan.concurrentUsersLow < 1)
         errors.push('Concurrent users (low) must be a positive integer');
     if (!Number.isInteger(plan.concurrentUsersHigh) || plan.concurrentUsersHigh < 1)
         errors.push('Concurrent users (high) must be a positive integer');
-    if (plan.concurrentUsersLow > plan.concurrentUsers || plan.concurrentUsers > plan.concurrentUsersHigh)
-        errors.push('Concurrent users must satisfy low ≤ expected ≤ high');
+    if (plan.concurrentUsersLow > plan.concurrentUsersHigh)
+        errors.push('Concurrent users: low must not exceed high');
+    if (plan.concurrentUsersLow > plan.totalUsersLow)
+        errors.push('Concurrent users (low) cannot exceed Total users (low)');
+    if (plan.concurrentUsersHigh > plan.totalUsersHigh)
+        errors.push('Concurrent users (high) cannot exceed Total users (high)');
+
     if (!Number.isInteger(plan.exchangesPerUserLow) || plan.exchangesPerUserLow < 1)
         errors.push('Exchanges per user (low) must be a positive integer');
     if (!Number.isInteger(plan.exchangesPerUserHigh) || plan.exchangesPerUserHigh < 1)
         errors.push('Exchanges per user (high) must be a positive integer');
-    if (plan.exchangesPerUserLow > plan.exchangesPerUser || plan.exchangesPerUser > plan.exchangesPerUserHigh)
-        errors.push('Exchanges per user must satisfy low ≤ expected ≤ high');
+    if (plan.exchangesPerUserLow > plan.exchangesPerUserHigh)
+        errors.push('Exchanges per user: low must not exceed high');
+
     if (typeof plan.exchangeRatePerHourLow !== 'number' || plan.exchangeRatePerHourLow <= 0)
         errors.push('Exchange rate (low) must be greater than 0');
     if (typeof plan.exchangeRatePerHourHigh !== 'number' || plan.exchangeRatePerHourHigh <= 0)
         errors.push('Exchange rate (high) must be greater than 0');
-    if (plan.exchangeRatePerHourLow > plan.exchangeRatePerHour || plan.exchangeRatePerHour > plan.exchangeRatePerHourHigh)
-        errors.push('Exchange rate must satisfy low ≤ expected ≤ high');
+    if (plan.exchangeRatePerHourLow > plan.exchangeRatePerHourHigh)
+        errors.push('Exchange rate: low must not exceed high');
 
     const pctSum = plan.distribution.reduce((s, b) => s + b.percentage, 0);
     if (Math.abs(pctSum - 100) > 0.01)
@@ -338,29 +337,28 @@ function renderPlanPage(container) {
                     : `→ ${gpus} GPUs`;
             }
 
-            // Calculate and update results
-            let result = null;
-            try {
-                result = calculatePlanEntry(plan, wsEntry);
-            } catch (e) { /* invalid inputs */ }
+            // Calculate both bounds (Low and High) and render each result
+            // as a range.
+            const resultLow = calcAtBound(plan, wsEntry, 'Low');
+            const resultHigh = calcAtBound(plan, wsEntry, 'High');
 
-            if (result) {
-                allResults.push({ result, wsEntry, gpus, tp });
+            if (resultLow && resultHigh) {
+                allResults.push({ resultLow, resultHigh, wsEntry, plan, gpus, tp });
                 refs.resultsDiv.innerHTML = `
                     <div class="plan-result-row">
                         <span class="plan-result-label">KV Cache Size:</span>
-                        <span class="plan-result-value">${formatSizeHuman(result.totalKVSizeBytes)}</span>
+                        <span class="plan-result-value">${formatRangeSize(resultLow.totalKVSizeBytes, resultHigh.totalKVSizeBytes)}</span>
                     </div>
                     <div class="plan-result-row">
                         <span class="plan-result-label">Write Throughput:</span>
-                        <span class="plan-result-value">${formatThroughputHuman(result.totalWriteGiBps)}</span>
+                        <span class="plan-result-value">${formatRangeThroughput(resultLow.totalWriteGiBps, resultHigh.totalWriteGiBps)}</span>
                     </div>
                     <div class="plan-result-row">
                         <span class="plan-result-label">Read Throughput:</span>
-                        <span class="plan-result-value">${formatThroughputHuman(result.totalReadGiBps)}</span>
+                        <span class="plan-result-value">${formatRangeThroughput(resultLow.totalReadGiBps, resultHigh.totalReadGiBps)}</span>
                     </div>
                 `;
-                refs.detailsDiv.innerHTML = showDetails ? buildDetailHTML(result, wsEntry) : '';
+                refs.detailsDiv.innerHTML = showDetails ? buildDetailHTML(resultLow, resultHigh, plan, wsEntry) : '';
             } else {
                 refs.resultsDiv.innerHTML = '';
                 refs.detailsDiv.innerHTML = '';
@@ -369,9 +367,9 @@ function renderPlanPage(container) {
 
         // Update roll-up
         if (rollupPanel) {
-            const results = allResults.map(r => r.result);
-            if (results.length > 0) {
-                const rollup = calculatePlanRollup(results);
+            if (allResults.length > 0) {
+                const rollupLow = calculatePlanRollup(allResults.map(r => r.resultLow));
+                const rollupHigh = calculatePlanRollup(allResults.map(r => r.resultHigh));
                 const totalGpus = allResults.reduce((s, r) => s + r.gpus, 0);
                 let rollupHTML = `
                     <h2 style="margin-top: 0;">Aggregate</h2>
@@ -381,15 +379,15 @@ function renderPlanPage(container) {
                     </div>
                     <div class="plan-result-row">
                         <span class="plan-result-label">Total KV Cache Size:</span>
-                        <span class="plan-result-value">${formatSizeHuman(rollup.totalKVSizeBytes)}</span>
+                        <span class="plan-result-value">${formatRangeSize(rollupLow.totalKVSizeBytes, rollupHigh.totalKVSizeBytes)}</span>
                     </div>
                     <div class="plan-result-row">
                         <span class="plan-result-label">Total Write Throughput:</span>
-                        <span class="plan-result-value">${formatThroughputHuman(rollup.totalWriteGiBps)}</span>
+                        <span class="plan-result-value">${formatRangeThroughput(rollupLow.totalWriteGiBps, rollupHigh.totalWriteGiBps)}</span>
                     </div>
                     <div class="plan-result-row">
                         <span class="plan-result-label">Total Read Throughput:</span>
-                        <span class="plan-result-value">${formatThroughputHuman(rollup.totalReadGiBps)}</span>
+                        <span class="plan-result-value">${formatRangeThroughput(rollupLow.totalReadGiBps, rollupHigh.totalReadGiBps)}</span>
                     </div>
                 `;
                 if (showDetails) {
@@ -443,46 +441,42 @@ function renderPlanPage(container) {
         gpuCountSpan.className = 'gpu-count-display';
         serverInstancesField.appendChild(gpuCountSpan);
         inputRow.appendChild(serverInstancesField);
-        inputRow.appendChild(buildTripletField(
+        inputRow.appendChild(buildRangeField(
             'Total users',
-            plan.totalUsersLow, plan.totalUsers, plan.totalUsersHigh,
+            plan.totalUsersLow, plan.totalUsersHigh,
             true,
             (which, v) => {
                 if (which === 'low') plan.totalUsersLow = v;
-                else if (which === 'expected') plan.totalUsers = v;
                 else plan.totalUsersHigh = v;
                 markDirty(); scheduleRecalc();
             }
         ));
-        inputRow.appendChild(buildTripletField(
+        inputRow.appendChild(buildRangeField(
             'Concurrent users',
-            plan.concurrentUsersLow, plan.concurrentUsers, plan.concurrentUsersHigh,
+            plan.concurrentUsersLow, plan.concurrentUsersHigh,
             true,
             (which, v) => {
                 if (which === 'low') plan.concurrentUsersLow = v;
-                else if (which === 'expected') plan.concurrentUsers = v;
                 else plan.concurrentUsersHigh = v;
                 markDirty(); scheduleRecalc();
             }
         ));
-        inputRow.appendChild(buildTripletField(
+        inputRow.appendChild(buildRangeField(
             'Exchanges/user',
-            plan.exchangesPerUserLow, plan.exchangesPerUser, plan.exchangesPerUserHigh,
+            plan.exchangesPerUserLow, plan.exchangesPerUserHigh,
             true,
             (which, v) => {
                 if (which === 'low') plan.exchangesPerUserLow = v;
-                else if (which === 'expected') plan.exchangesPerUser = v;
                 else plan.exchangesPerUserHigh = v;
                 markDirty(); scheduleRecalc();
             }
         ));
-        inputRow.appendChild(buildTripletField(
+        inputRow.appendChild(buildRangeField(
             'Rate/hr/user',
-            plan.exchangeRatePerHourLow, plan.exchangeRatePerHour, plan.exchangeRatePerHourHigh,
+            plan.exchangeRatePerHourLow, plan.exchangeRatePerHourHigh,
             false,
             (which, v) => {
                 if (which === 'low') plan.exchangeRatePerHourLow = v;
-                else if (which === 'expected') plan.exchangeRatePerHour = v;
                 else plan.exchangeRatePerHourHigh = v;
                 markDirty(); scheduleRecalc();
             }
@@ -694,13 +688,13 @@ function renderPlanPage(container) {
         return wrapper;
     }
 
-    // Triplet (low / expected / high) field builder for scenario-range inputs.
-    // onChange receives (which, value) where which is 'low' | 'expected' | 'high'.
-    function buildTripletField(labelText, lowValue, expValue, highValue, isInt, onChange) {
+    // Range (low / high) field builder. onChange receives (which, value)
+    // where which is 'low' | 'high'.
+    function buildRangeField(labelText, lowValue, highValue, isInt, onChange) {
         const wrapper = document.createElement('label');
         wrapper.textContent = labelText;
         const row = document.createElement('div');
-        row.className = 'plan-triplet';
+        row.className = 'plan-range';
 
         const makeInput = (value, which, title) => {
             const input = document.createElement('input');
@@ -716,27 +710,73 @@ function renderPlanPage(container) {
             return input;
         };
 
-        row.appendChild(makeInput(lowValue, 'low', 'Low / pessimistic'));
-        row.appendChild(makeInput(expValue, 'expected', 'Expected (drives Plan-page calculations)'));
-        row.appendChild(makeInput(highValue, 'high', 'High / optimistic'));
+        row.appendChild(makeInput(lowValue, 'low', 'Low / conservative'));
+        row.appendChild(makeInput(highValue, 'high', 'High / aggressive'));
         wrapper.appendChild(row);
         return wrapper;
     }
 
     // -----------------------------------------------------------------------
-    // Detail breakdown HTML for a single model
+    // Scenario-range helpers
     // -----------------------------------------------------------------------
-    function buildDetailHTML(result, wsEntry) {
+
+    // Build a point-estimate plan object for a given bound ('Low' or 'High')
+    // suitable for passing to calculator.js functions that expect the legacy
+    // single-value field names (totalUsers, concurrentUsers, etc.).
+    function planAtBound(plan, bound) {
+        return {
+            ...plan,
+            totalUsers: plan[`totalUsers${bound}`],
+            concurrentUsers: plan[`concurrentUsers${bound}`],
+            exchangesPerUser: plan[`exchangesPerUser${bound}`],
+            exchangeRatePerHour: plan[`exchangeRatePerHour${bound}`]
+        };
+    }
+
+    function calcAtBound(plan, wsEntry, bound) {
+        try {
+            return calculatePlanEntry(planAtBound(plan, bound), wsEntry);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function formatRangeSize(lowBytes, highBytes) {
+        if (Math.abs(highBytes - lowBytes) < 1) return formatSizeHuman(lowBytes);
+        return `${formatSizeHuman(lowBytes)} – ${formatSizeHuman(highBytes)}`;
+    }
+
+    function formatRangeThroughput(lowGiBps, highGiBps) {
+        if (Math.abs(highGiBps - lowGiBps) < 1e-9) return formatThroughputHuman(lowGiBps);
+        return `${formatThroughputHuman(lowGiBps)} – ${formatThroughputHuman(highGiBps)}`;
+    }
+
+    function formatRangeCount(lowN, highN) {
+        const lo = Math.round(lowN).toLocaleString();
+        const hi = Math.round(highN).toLocaleString();
+        return lo === hi ? lo : `${lo} – ${hi}`;
+    }
+
+    function formatRangeFloat(lowN, highN, decimals = 3) {
+        const lo = lowN.toFixed(decimals);
+        const hi = highN.toFixed(decimals);
+        return lo === hi ? lo : `${lo} – ${hi}`;
+    }
+
+    // -----------------------------------------------------------------------
+    // Detail breakdown HTML for a single model — renders both bounds in parallel
+    // -----------------------------------------------------------------------
+    function buildDetailHTML(resultLow, resultHigh, plan, wsEntry) {
         const lines = [];
 
         lines.push('<h3 style="margin-top: 10px;">Calculation Details</h3>');
 
-        // KV Cache Size derivation
-        const totalExchanges = result.totalUsers * result.exchangesPerUser;
+        // KV Cache Size derivation — one substituted line per bound
+        const totalExchLow  = plan.totalUsersLow  * plan.exchangesPerUserLow;
+        const totalExchHigh = plan.totalUsersHigh * plan.exchangesPerUserHigh;
         const kvPreamble =
-            'total_exchanges = totalUsers × exchangesPerUser\n' +
-            `                = ${result.totalUsers.toLocaleString()} × ${result.exchangesPerUser.toLocaleString()}\n` +
-            `                = ${totalExchanges.toLocaleString()} stored exchanges`;
+            `total_exchanges_low  = ${plan.totalUsersLow.toLocaleString()} × ${plan.exchangesPerUserLow.toLocaleString()} = ${totalExchLow.toLocaleString()} stored exchanges\n` +
+            `total_exchanges_high = ${plan.totalUsersHigh.toLocaleString()} × ${plan.exchangesPerUserHigh.toLocaleString()} = ${totalExchHigh.toLocaleString()} stored exchanges`;
 
         lines.push('<div class="plan-detail-section">');
         lines.push('<strong>KV Cache Size</strong>');
@@ -744,19 +784,27 @@ function renderPlanPage(container) {
 
         lines.push('<div class="plan-detail-table-wrap">');
         lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Exchanges</th><th>KV/seq</th><th>Subtotal</th></tr></thead><tbody>');
-        for (const b of result.bucketDetails) {
-            lines.push(`<tr><td>${b.contextSize.toLocaleString()}</td><td>${b.percentage}%</td><td>${Math.round(b.exchanges).toLocaleString()}</td><td>${formatSizeHuman(b.kvBytesPerSeq)}</td><td>${formatSizeHuman(b.sizeBytes)}</td></tr>`);
+        for (let i = 0; i < resultLow.bucketDetails.length; i++) {
+            const bL = resultLow.bucketDetails[i];
+            const bH = resultHigh.bucketDetails[i];
+            lines.push(
+                `<tr><td>${bL.contextSize.toLocaleString()}</td>` +
+                `<td>${bL.percentage}%</td>` +
+                `<td>${formatRangeCount(bL.exchanges, bH.exchanges)}</td>` +
+                `<td>${formatSizeHuman(bL.kvBytesPerSeq)}</td>` +
+                `<td>${formatRangeSize(bL.sizeBytes, bH.sizeBytes)}</td></tr>`
+            );
         }
-        lines.push(`</tbody><tfoot><tr><td colspan="4" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatSizeHuman(result.totalKVSizeBytes)}</td></tr></tfoot></table>`);
+        lines.push(`</tbody><tfoot><tr><td colspan="4" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatRangeSize(resultLow.totalKVSizeBytes, resultHigh.totalKVSizeBytes)}</td></tr></tfoot></table>`);
         lines.push('</div>');
         lines.push('</div>');
 
-        // Throughput derivation
-        const ratePerSec = result.serverInstances * result.concurrentUsers * result.exchangeRatePerHour / 3600;
+        // Throughput derivation — one substituted line per bound
+        const rateLowPerSec  = plan.serverInstances * plan.concurrentUsersLow  * plan.exchangeRatePerHourLow  / 3600;
+        const rateHighPerSec = plan.serverInstances * plan.concurrentUsersHigh * plan.exchangeRatePerHourHigh / 3600;
         const tpPreamble =
-            'aggregate_exchanges_per_sec = serverInstances × concurrentUsers × exchangeRatePerHour ÷ 3600\n' +
-            `                            = ${result.serverInstances} × ${result.concurrentUsers} × ${result.exchangeRatePerHour} ÷ 3600\n` +
-            `                            = ${ratePerSec.toFixed(3)} exchanges/sec`;
+            `aggregate_exchanges_per_sec_low  = ${plan.serverInstances} × ${plan.concurrentUsersLow} × ${plan.exchangeRatePerHourLow} ÷ 3600 = ${rateLowPerSec.toFixed(3)} exchanges/sec\n` +
+            `aggregate_exchanges_per_sec_high = ${plan.serverInstances} × ${plan.concurrentUsersHigh} × ${plan.exchangeRatePerHourHigh} ÷ 3600 = ${rateHighPerSec.toFixed(3)} exchanges/sec`;
 
         lines.push('<div class="plan-detail-section">');
         lines.push('<strong>Throughput</strong>');
@@ -764,13 +812,26 @@ function renderPlanPage(container) {
 
         lines.push('<div class="plan-detail-table-wrap">');
         lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Exch/sec</th><th>Hit Rate</th><th>Hits/sec</th><th>Misses/sec</th><th>Write</th><th>Read</th></tr></thead><tbody>');
-        for (const b of result.bucketDetails) {
-            const hitFrac = b.cacheHitRate / 100;
-            const hitsPerSec = b.exchangesPerSec * hitFrac;
-            const missesPerSec = b.exchangesPerSec * (1 - hitFrac);
-            lines.push(`<tr><td>${b.contextSize.toLocaleString()}</td><td>${b.percentage}%</td><td>${b.exchangesPerSec.toFixed(3)}</td><td>${b.cacheHitRate}%</td><td>${hitsPerSec.toFixed(3)}</td><td>${missesPerSec.toFixed(3)}</td><td>${formatThroughputHuman(b.writeBytesPerSec / (1024 ** 3))}</td><td>${formatThroughputHuman(b.readBytesPerSec / (1024 ** 3))}</td></tr>`);
+        for (let i = 0; i < resultLow.bucketDetails.length; i++) {
+            const bL = resultLow.bucketDetails[i];
+            const bH = resultHigh.bucketDetails[i];
+            const hitFrac = bL.cacheHitRate / 100;
+            const hitsLowPerSec    = bL.exchangesPerSec * hitFrac;
+            const hitsHighPerSec   = bH.exchangesPerSec * hitFrac;
+            const missesLowPerSec  = bL.exchangesPerSec * (1 - hitFrac);
+            const missesHighPerSec = bH.exchangesPerSec * (1 - hitFrac);
+            lines.push(
+                `<tr><td>${bL.contextSize.toLocaleString()}</td>` +
+                `<td>${bL.percentage}%</td>` +
+                `<td>${formatRangeFloat(bL.exchangesPerSec, bH.exchangesPerSec)}</td>` +
+                `<td>${bL.cacheHitRate}%</td>` +
+                `<td>${formatRangeFloat(hitsLowPerSec, hitsHighPerSec)}</td>` +
+                `<td>${formatRangeFloat(missesLowPerSec, missesHighPerSec)}</td>` +
+                `<td>${formatRangeThroughput(bL.writeBytesPerSec / (1024 ** 3), bH.writeBytesPerSec / (1024 ** 3))}</td>` +
+                `<td>${formatRangeThroughput(bL.readBytesPerSec  / (1024 ** 3), bH.readBytesPerSec  / (1024 ** 3))}</td></tr>`
+            );
         }
-        lines.push(`</tbody><tfoot><tr><td colspan="6" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatThroughputHuman(result.totalWriteGiBps)}</td><td style="font-weight: 600;">${formatThroughputHuman(result.totalReadGiBps)}</td></tr></tfoot></table>`);
+        lines.push(`</tbody><tfoot><tr><td colspan="6" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatRangeThroughput(resultLow.totalWriteGiBps, resultHigh.totalWriteGiBps)}</td><td style="font-weight: 600;">${formatRangeThroughput(resultLow.totalReadGiBps, resultHigh.totalReadGiBps)}</td></tr></tfoot></table>`);
         lines.push('</div>');
         lines.push('</div>');
 
@@ -784,9 +845,15 @@ function renderPlanPage(container) {
         const lines = [];
         lines.push('<h3 style="margin-top: 10px;">Per-Model Breakdown</h3>');
         lines.push('<table class="plan-detail-table"><thead><tr><th>Model</th><th>GPUs</th><th>KV Cache Size</th><th>Write</th><th>Read</th></tr></thead><tbody>');
-        for (const { result, wsEntry, gpus, tp } of allResults) {
+        for (const { resultLow, resultHigh, wsEntry, gpus, tp } of allResults) {
             const gpuCell = tp > 1 ? `${gpus} (TP=${tp})` : `${gpus}`;
-            lines.push(`<tr><td>${wsEntry.title}</td><td>${gpuCell}</td><td>${formatSizeHuman(result.totalKVSizeBytes)}</td><td>${formatThroughputHuman(result.totalWriteGiBps)}</td><td>${formatThroughputHuman(result.totalReadGiBps)}</td></tr>`);
+            lines.push(
+                `<tr><td>${wsEntry.title}</td>` +
+                `<td>${gpuCell}</td>` +
+                `<td>${formatRangeSize(resultLow.totalKVSizeBytes, resultHigh.totalKVSizeBytes)}</td>` +
+                `<td>${formatRangeThroughput(resultLow.totalWriteGiBps, resultHigh.totalWriteGiBps)}</td>` +
+                `<td>${formatRangeThroughput(resultLow.totalReadGiBps, resultHigh.totalReadGiBps)}</td></tr>`
+            );
         }
         lines.push('</tbody></table>');
         return lines.join('');

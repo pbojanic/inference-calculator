@@ -455,14 +455,14 @@ button:disabled {
     white-space: nowrap;
 }
 
-.plan-triplet {
+.plan-range {
     display: flex;
     gap: 2px;
     margin-top: 2px;
 }
 
-.plan-triplet input {
-    width: calc(33.333% - 2px);
+.plan-range input {
+    width: calc(50% - 1px);
     margin-top: 0;
     padding: 6px 4px;
     font-size: 0.8rem;
