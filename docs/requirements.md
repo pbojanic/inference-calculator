@@ -382,10 +382,10 @@ Below the per-model cards, a final **Aggregate** card rolls up all workspace mod
 Every chart on the Graphs page uses the same horizontal range-bar idiom:
 
 - **Chart type:** horizontal floating-bar with `data = [[low, high]]`.
-- **x-axis:** GiB for capacity charts, GiB/s for throughput charts. Starts at 0; upper bound `1.15 × High` for headroom.
+- **Shared x-axis scale:** all charts of the same type (capacity, write throughput, read throughput) use an identical x-axis range — computed once from the Aggregate High for that type, as `1.15 × Aggregate.High`. Per-model bars appear visually small relative to the aggregate, making cross-model comparison direct. The axis unit label is GiB for capacity and GiB/s for throughput.
 - **Bar:** spans from Low to High, semi-transparent in the accent color.
-- **Summary line:** one centered text line directly beneath the bar in the form `Low 0.12 · High 0.36` (values formatted via `formatSizeHuman` for capacity or `formatThroughputHuman` for throughput). The summary always renders at a fixed centered position — readable regardless of how narrow the range is.
-- **No-range fallback:** when Low = High the floating bar would have zero width. A minimum visible width (~2% of the x-axis) is drawn centered on the Low = High value so the chart is never blank.
+- **Summary line:** a small centered text line *outside the canvas* (rendered as a `<div class="graphs-chart-summary">`) directly beneath each chart, reading `Low 0.12 · High 0.36` (values formatted via `formatSizeHuman` for capacity or `formatThroughputHuman` for throughput). When Low = High the summary collapses to the single value. Placing the summary in the DOM rather than on the canvas guarantees it never collides with the x-axis tick labels.
+- **No-range fallback:** when Low = High the floating bar would have zero width. A minimum visible width (~1% of the shared x-axis) is drawn centered on the Low = High value so the chart is never blank.
 
 ### Per-model: Capacity
 

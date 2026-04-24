@@ -20,7 +20,7 @@ function renderGraphsPage(container) {
         intro.style.cssText = 'margin: 0 0 16px; color: var(--text-muted); max-width: 780px;';
         intro.textContent =
             'Capacity and throughput ranges per workspace model, plus an aggregate roll-up. ' +
-            'Each bar spans the Low and High scenarios from the Plan-page ranges.';
+            'Every chart of the same type shares the same x-axis scale (taken from the aggregate High) so bars are directly comparable across models.';
         container.appendChild(intro);
 
         const workspaceModels = getWorkspaceModels();
@@ -35,18 +35,52 @@ function renderGraphsPage(container) {
 
         const planStore = syncPlanWithWorkspace();
 
+        // First pass: compute points for every model so we can pre-derive a
+        // shared x-axis scale (taken from the aggregate) before rendering.
         const perModel = [];
         for (const wsEntry of workspaceModels) {
             const plan = planStore[wsEntry.id];
             const points = plan ? computePoints(plan, wsEntry) : null;
             perModel.push({ wsEntry, plan, points });
-            container.appendChild(buildModelGraphCard(wsEntry, plan, points));
         }
 
-        const anyWithPlan = perModel.some(m => m.points);
-        if (anyWithPlan) {
-            container.appendChild(buildAggregateCard(perModel.filter(m => m.points)));
+        const modelsWithPoints = perModel.filter(m => m.points);
+        let aggregate = null;
+        let xMaxes = null;
+        if (modelsWithPoints.length > 0) {
+            aggregate = computeAggregate(modelsWithPoints);
+            xMaxes = {
+                capacity: computeSharedXMax(aggregate.capacity),
+                write:    computeSharedXMax(aggregate.write),
+                read:     computeSharedXMax(aggregate.read)
+            };
         }
+
+        // Second pass: render each per-model card with the shared x-axis scale.
+        for (const m of perModel) {
+            container.appendChild(buildModelGraphCard(m.wsEntry, m.plan, m.points, xMaxes));
+        }
+
+        if (aggregate) {
+            container.appendChild(buildAggregateCard(aggregate, xMaxes));
+        }
+    }
+
+    function computeAggregate(modelsWithPoints) {
+        const sum = (selector) => ({
+            low:  modelsWithPoints.reduce((s, m) => s + selector(m.points).low,  0),
+            high: modelsWithPoints.reduce((s, m) => s + selector(m.points).high, 0),
+        });
+        return {
+            capacity: sum(p => p.capacity),
+            write:    sum(p => p.write),
+            read:     sum(p => p.read),
+        };
+    }
+
+    function computeSharedXMax(aggVals) {
+        const rawMax = Math.max(aggVals.high, aggVals.low, 0);
+        return rawMax > 0 ? rawMax * 1.15 : 1;
     }
 
     // Compute capacity + write + read {low, high} pairs by running
@@ -86,7 +120,7 @@ function renderGraphsPage(container) {
         }
     }
 
-    function buildModelGraphCard(wsEntry, plan, points) {
+    function buildModelGraphCard(wsEntry, plan, points, xMaxes) {
         const card = document.createElement('div');
         card.className = 'panel graphs-card';
         card.style.marginBottom = '16px';
@@ -113,25 +147,14 @@ function renderGraphsPage(container) {
             return card;
         }
 
-        appendChart(card, points.capacity, 'Capacity',         'GiB',   formatSizeHumanFromGiB);
-        appendChart(card, points.write,    'Write throughput', 'GiB/s', formatThroughputHuman);
-        appendChart(card, points.read,     'Read throughput',  'GiB/s', formatThroughputHuman);
+        appendChart(card, points.capacity, 'Capacity',         'GiB',   formatSizeHumanFromGiB, xMaxes.capacity);
+        appendChart(card, points.write,    'Write throughput', 'GiB/s', formatThroughputHuman,   xMaxes.write);
+        appendChart(card, points.read,     'Read throughput',  'GiB/s', formatThroughputHuman,   xMaxes.read);
 
         return card;
     }
 
-    function buildAggregateCard(perModelWithPlan) {
-        const sum = (selector) => ({
-            low:  perModelWithPlan.reduce((s, m) => s + selector(m.points).low,  0),
-            high: perModelWithPlan.reduce((s, m) => s + selector(m.points).high, 0),
-        });
-
-        const totals = {
-            capacity: sum(p => p.capacity),
-            write:    sum(p => p.write),
-            read:     sum(p => p.read),
-        };
-
+    function buildAggregateCard(aggregate, xMaxes) {
         const card = document.createElement('div');
         card.className = 'panel graphs-card graphs-aggregate-card';
         card.style.marginBottom = '16px';
@@ -144,20 +167,30 @@ function renderGraphsPage(container) {
         header.appendChild(titleSpan);
         card.appendChild(header);
 
-        appendChart(card, totals.capacity, 'Total capacity', 'GiB', formatSizeHumanFromGiB);
-        appendChart(card, totals.write,    'Total write throughput', 'GiB/s', formatThroughputHuman);
-        appendChart(card, totals.read,     'Total read throughput',  'GiB/s', formatThroughputHuman);
+        appendChart(card, aggregate.capacity, 'Total capacity',         'GiB',   formatSizeHumanFromGiB, xMaxes.capacity);
+        appendChart(card, aggregate.write,    'Total write throughput', 'GiB/s', formatThroughputHuman,   xMaxes.write);
+        appendChart(card, aggregate.read,     'Total read throughput',  'GiB/s', formatThroughputHuman,   xMaxes.read);
 
         return card;
     }
 
-    function appendChart(card, vals, title, axisUnit, formatter) {
+    function appendChart(card, vals, title, axisUnit, formatter, xMax) {
         const wrap = document.createElement('div');
         wrap.className = 'graphs-chart-wrap';
         const canvas = document.createElement('canvas');
         wrap.appendChild(canvas);
         card.appendChild(wrap);
-        chartInstances.push(buildRangeBarChart(canvas, vals, title, axisUnit, formatter));
+
+        // Summary lives in the DOM, not the canvas — avoids any collision with
+        // the x-axis tick labels and stays readable when the range is narrow.
+        const summary = document.createElement('div');
+        summary.className = 'graphs-chart-summary';
+        summary.textContent = vals.low === vals.high
+            ? formatter(vals.low)
+            : `Low ${formatter(vals.low)}  ·  High ${formatter(vals.high)}`;
+        card.appendChild(summary);
+
+        chartInstances.push(buildRangeBarChart(canvas, vals, title, axisUnit, formatter, xMax));
     }
 
     function formatSizeHumanFromGiB(gib) {
@@ -165,42 +198,16 @@ function renderGraphsPage(container) {
         return formatSizeHuman(gib * BYTES_PER_GIB);
     }
 
-    // Horizontal range bar [low, high] with a single centered summary line
-    // "Low … · High …" beneath the chart area. The centered-summary approach
-    // avoids overlap problems that positioned labels have when the range is
-    // narrow or zero.
-    function buildRangeBarChart(canvas, vals, title, axisUnit, formatter) {
+    // Horizontal range bar [low, high]. The xMax is supplied by the caller so
+    // that every chart of the same type shares one axis scale. Summary text is
+    // rendered as a DOM element in appendChart, not drawn on the canvas.
+    function buildRangeBarChart(canvas, vals, title, axisUnit, formatter, xMax) {
         const ctx = canvas.getContext('2d');
-
-        const rawMax = Math.max(vals.high, vals.low, 0);
-        const xMax = rawMax > 0 ? rawMax * 1.15 : 1;
 
         const hasRange = (vals.high - vals.low) > xMax * 0.001;
         const midpoint = (vals.low + vals.high) / 2;
         const barLo = hasRange ? vals.low  : Math.max(0, midpoint - xMax * 0.01);
         const barHi = hasRange ? vals.high : midpoint + xMax * 0.01;
-
-        const annotations = {
-            id: 'rangeBarAnnotations',
-            afterDatasetsDraw(chart) {
-                const { ctx: c, chartArea } = chart;
-                const midY = (chartArea.top + chartArea.bottom) / 2;
-                const barBottom = midY + 14;
-
-                // Single centered summary line — always readable regardless of range
-                c.save();
-                c.fillStyle = '#ddd';
-                c.font = '11px sans-serif';
-                c.textAlign = 'center';
-                c.textBaseline = 'top';
-                const summary = vals.low === vals.high
-                    ? formatter(vals.low)
-                    : `Low ${formatter(vals.low)}  ·  High ${formatter(vals.high)}`;
-                const centerX = (chartArea.left + chartArea.right) / 2;
-                c.fillText(summary, centerX, barBottom + 12);
-                c.restore();
-            }
-        };
 
         return new Chart(ctx, {
             type: 'bar',
@@ -243,10 +250,8 @@ function renderGraphsPage(container) {
                         ticks: { display: false },
                         grid: { display: false }
                     }
-                },
-                layout: { padding: { bottom: 22 } }
-            },
-            plugins: [annotations]
+                }
+            }
         });
     }
 

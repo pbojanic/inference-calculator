@@ -482,6 +482,14 @@ button:disabled {
     margin-top: 8px;
 }
 
+.graphs-chart-summary {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    margin-top: 2px;
+    margin-bottom: 4px;
+}
+
 /* ===========================================================================
    References page
    =========================================================================== */
