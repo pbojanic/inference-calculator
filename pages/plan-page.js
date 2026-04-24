@@ -39,10 +39,14 @@ function defaultPlanEntry(workspaceId) {
         workspaceId,
         serverInstances: 1,
         totalUsers: 100,
+        totalUsersLow: 100,
+        totalUsersHigh: 100,
         concurrentUsers: 10,
         concurrentUsersLow: 10,
         concurrentUsersHigh: 10,
         exchangesPerUser: 50,
+        exchangesPerUserLow: 50,
+        exchangesPerUserHigh: 50,
         exchangeRatePerHour: 10,
         exchangeRatePerHourLow: 10,
         exchangeRatePerHourHigh: 10,
@@ -73,8 +77,12 @@ function syncPlanWithWorkspace() {
     // Migrate older plans that predate scenario triples: seed low/high from the
     // existing point estimate so they start with no uncertainty.
     for (const plan of Object.values(store)) {
+        if (plan.totalUsersLow === undefined) plan.totalUsersLow = plan.totalUsers;
+        if (plan.totalUsersHigh === undefined) plan.totalUsersHigh = plan.totalUsers;
         if (plan.concurrentUsersLow === undefined) plan.concurrentUsersLow = plan.concurrentUsers;
         if (plan.concurrentUsersHigh === undefined) plan.concurrentUsersHigh = plan.concurrentUsers;
+        if (plan.exchangesPerUserLow === undefined) plan.exchangesPerUserLow = plan.exchangesPerUser;
+        if (plan.exchangesPerUserHigh === undefined) plan.exchangesPerUserHigh = plan.exchangesPerUser;
         if (plan.exchangeRatePerHourLow === undefined) plan.exchangeRatePerHourLow = plan.exchangeRatePerHour;
         if (plan.exchangeRatePerHourHigh === undefined) plan.exchangeRatePerHourHigh = plan.exchangeRatePerHour;
     }
@@ -109,12 +117,24 @@ function validatePlanEntry(plan, maxContext) {
         errors.push('Exchange rate must be greater than 0');
 
     // Scenario-triple validation
+    if (!Number.isInteger(plan.totalUsersLow) || plan.totalUsersLow < 1)
+        errors.push('Total users (low) must be a positive integer');
+    if (!Number.isInteger(plan.totalUsersHigh) || plan.totalUsersHigh < 1)
+        errors.push('Total users (high) must be a positive integer');
+    if (plan.totalUsersLow > plan.totalUsers || plan.totalUsers > plan.totalUsersHigh)
+        errors.push('Total users must satisfy low ≤ expected ≤ high');
     if (!Number.isInteger(plan.concurrentUsersLow) || plan.concurrentUsersLow < 1)
         errors.push('Concurrent users (low) must be a positive integer');
     if (!Number.isInteger(plan.concurrentUsersHigh) || plan.concurrentUsersHigh < 1)
         errors.push('Concurrent users (high) must be a positive integer');
     if (plan.concurrentUsersLow > plan.concurrentUsers || plan.concurrentUsers > plan.concurrentUsersHigh)
         errors.push('Concurrent users must satisfy low ≤ expected ≤ high');
+    if (!Number.isInteger(plan.exchangesPerUserLow) || plan.exchangesPerUserLow < 1)
+        errors.push('Exchanges per user (low) must be a positive integer');
+    if (!Number.isInteger(plan.exchangesPerUserHigh) || plan.exchangesPerUserHigh < 1)
+        errors.push('Exchanges per user (high) must be a positive integer');
+    if (plan.exchangesPerUserLow > plan.exchangesPerUser || plan.exchangesPerUser > plan.exchangesPerUserHigh)
+        errors.push('Exchanges per user must satisfy low ≤ expected ≤ high');
     if (typeof plan.exchangeRatePerHourLow !== 'number' || plan.exchangeRatePerHourLow <= 0)
         errors.push('Exchange rate (low) must be greater than 0');
     if (typeof plan.exchangeRatePerHourHigh !== 'number' || plan.exchangeRatePerHourHigh <= 0)
@@ -423,9 +443,17 @@ function renderPlanPage(container) {
         gpuCountSpan.className = 'gpu-count-display';
         serverInstancesField.appendChild(gpuCountSpan);
         inputRow.appendChild(serverInstancesField);
-        inputRow.appendChild(buildNumberField('Total users', plan.totalUsers, 1, null, true, v => {
-            plan.totalUsers = v; markDirty(); scheduleRecalc();
-        }));
+        inputRow.appendChild(buildTripletField(
+            'Total users',
+            plan.totalUsersLow, plan.totalUsers, plan.totalUsersHigh,
+            true,
+            (which, v) => {
+                if (which === 'low') plan.totalUsersLow = v;
+                else if (which === 'expected') plan.totalUsers = v;
+                else plan.totalUsersHigh = v;
+                markDirty(); scheduleRecalc();
+            }
+        ));
         inputRow.appendChild(buildTripletField(
             'Concurrent users',
             plan.concurrentUsersLow, plan.concurrentUsers, plan.concurrentUsersHigh,
@@ -437,9 +465,17 @@ function renderPlanPage(container) {
                 markDirty(); scheduleRecalc();
             }
         ));
-        inputRow.appendChild(buildNumberField('Exchanges/user', plan.exchangesPerUser, 1, null, true, v => {
-            plan.exchangesPerUser = v; markDirty(); scheduleRecalc();
-        }));
+        inputRow.appendChild(buildTripletField(
+            'Exchanges/user',
+            plan.exchangesPerUserLow, plan.exchangesPerUser, plan.exchangesPerUserHigh,
+            true,
+            (which, v) => {
+                if (which === 'low') plan.exchangesPerUserLow = v;
+                else if (which === 'expected') plan.exchangesPerUser = v;
+                else plan.exchangesPerUserHigh = v;
+                markDirty(); scheduleRecalc();
+            }
+        ));
         inputRow.appendChild(buildTripletField(
             'Rate/hr/user',
             plan.exchangeRatePerHourLow, plan.exchangeRatePerHour, plan.exchangeRatePerHourHigh,

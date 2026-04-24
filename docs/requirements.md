@@ -212,9 +212,9 @@ The Plan page displays one row per workspace model, identified by the model's ti
 Each plan entry has the following editable fields:
 
 - **Server instances** (positive integer, default 1) — the number of inference server instances running this model. This equals total GPUs divided by the model's tensor parallelism setting. More instances means more IO to the shared storage.
-- **Total users** (positive integer, default 100) — the total number of users who have stored KV caches for this model.
-- **Concurrent users** (*triple*: low / expected / high, each a positive integer; expected default 10) — the number of users actively using the model at any given moment. Must be less than or equal to total users. The Plan page's headline KV-cache and throughput calculations use the **Expected** value. Low and High values are only consulted by the Graphs page. Default values for Low and High are equal to Expected (i.e. no uncertainty until the user widens the range).
-- **Stored exchanges per user** (positive integer, default 50) — the number of distinct input contexts (exchanges) stored per user. For chat applications this might be ~50; for coding agents ~200. This drives the size calculation.
+- **Total users** (*triple*: low / expected / high, each a positive integer; expected default 100) — the total number of users who have stored KV caches for this model. The Plan page's headline KV-cache and throughput calculations use the **Expected** value. Low and High values are only consulted by the Graphs page.
+- **Concurrent users** (*triple*: low / expected / high, each a positive integer; expected default 10) — the number of users actively using the model at any given moment. Must be less than or equal to total users (Expected). The Plan page's headline KV-cache and throughput calculations use the **Expected** value. Low and High values are only consulted by the Graphs page. Default values for Low and High are equal to Expected (i.e. no uncertainty until the user widens the range).
+- **Stored exchanges per user** (*triple*: low / expected / high, each a positive integer; expected default 50) — the number of distinct input contexts (exchanges) stored per user. For chat applications this might be ~50; for coding agents ~200. This drives the size calculation. Same Expected-drives-Plan-page, triple-drives-Graphs rule applies.
 - **Exchange rate per hour** (*triple*: low / expected / high, each a positive number; expected default 10) — the number of new exchanges generated per concurrent user per hour. Same Expected-drives-Plan-page, triple-drives-Graphs rule applies.
 - **Derived GPU count** — Each plan entry displays the total number of GPUs the planned deployment represents, calculated as:
 
@@ -224,7 +224,7 @@ Each plan entry has the following editable fields:
 
   where `deployment.tp` is the tensor-parallel value configured on the model's Model Details page (default 1). The derived value is shown inline next to the Server instances input as muted read-only text (e.g. `→ 80 GPUs (TP=8)`), and updates automatically whenever the server-instance count changes on the Plan page or the tensor-parallel setting is changed on the Model Details page. The value is read-only — it can only be influenced by editing its two inputs. For models deployed at TP=1, the readout shows just the GPU count (e.g. `→ 1 GPUs`).
 
-**Scenario triples** — Selected fuzzy inputs (*Concurrent users*, *Exchange rate per hour*) are captured as `{low, expected, high}` triples rather than single numbers. The Plan page's headline computations and the Calculation details view continue to use only the Expected value, preserving current behavior. The Graphs page consumes the triples to render cones of uncertainty. Validation: `low ≤ expected ≤ high` for each triple, all values positive.
+**Scenario triples** — Selected fuzzy inputs (*Total users*, *Concurrent users*, *Stored exchanges per user*, *Exchange rate per hour*) are captured as `{low, expected, high}` triples rather than single numbers. The Plan page's headline computations and the Calculation details view continue to use only the Expected value, preserving current behavior. The Graphs page consumes the triples to render range bars for capacity and throughput. Validation: `low ≤ expected ≤ high` for each triple, all values positive.
 
 ### Input token distribution
 
@@ -376,30 +376,56 @@ The Graphs page is a dedicated top-level page accessible from the navigation bar
 
 ### Layout
 
-One card per workspace model, in the same order as the Plan page. Each card shows:
+One card per workspace model, in the same order as the Plan page. Each per-model card shows:
 
 - The model title (matches the Plan page title).
-- Two stacked charts: **Write throughput (GiB/s)** on top, **Read throughput (GiB/s)** below, sharing the same x-axis (GiB/s).
+- Three stacked range-bar charts: **Capacity (GiB)** on top, then **Write throughput (GiB/s)**, then **Read throughput (GiB/s)**.
 
-### First chart: throughput range at a fixed concurrency
+Below the per-model cards, a final **Aggregate** card rolls up all workspace models into three corresponding charts: Total capacity, Total write throughput, Total read throughput.
 
-The chart answers "at this customer's stated concurrency, what range of throughput do I need to provision?" The concurrent-user count is **held fixed at the Plan-page Expected value** (the customer-supplied number). The uncertainty comes from the `exchangeRatePerHour` triple.
+### Chart form (shared)
 
-- **Chart type:** horizontal floating-bar (range bar) per output (Write, Read).
-- **x-axis:** GiB/s, starting at 0, upper bound set dynamically to `1.15 × Max` (so the Max label has headroom).
-- **Bar:** spans from `Min` GiB/s to `Max` GiB/s, semi-transparent in the accent color.
-- **Expected marker:** a solid vertical tick across the bar at the Expected GiB/s value, rendered slightly darker than the bar fill.
-- **Three computed values:**
-  - **Min** — `calculatePlanEntry` with `concurrentUsers = plan.concurrentUsers` (Expected), `exchangeRatePerHour = exchangeRatePerHourLow`, per-bucket `cacheHitRate` unchanged.
-  - **Expected** — same, but with `exchangeRatePerHour = exchangeRatePerHour` (Expected). Matches the Plan page's headline throughput.
-  - **Max** — same, but with `exchangeRatePerHour = exchangeRatePerHourHigh`.
-- **Numeric labels:** three labels rendered on the chart — `Min 0.12`, `Expected 0.24`, `Max 0.36` (values formatted to match the Plan page's `formatThroughputHuman`) — positioned beneath the bar at the corresponding x coordinates.
-- **Title:** each chart's title reads `Write throughput — at N concurrent users` (or Read), where N is the fixed Expected concurrent-users value. The title makes the fixed point explicit.
+Every chart on the Graphs page uses the same horizontal range-bar idiom:
 
-The `concurrentUsers` triple's Low and High values are **not used by this chart**. They remain in the data model for future graph types that vary concurrency.
+- **Chart type:** horizontal floating-bar (range bar) with `data = [[min, max]]`.
+- **x-axis:** GiB for capacity charts, GiB/s for throughput charts. Starts at 0; upper bound `1.15 × Max` for headroom.
+- **Bar:** spans from Min to Max, semi-transparent in the accent color.
+- **Expected marker:** a solid vertical tick across the bar at the Expected value, rendered slightly darker than the bar fill.
+- **Summary line:** one centered text line directly beneath the bar in the form `Min 0.12 · Expected 0.24 · Max 0.36` (values formatted via `formatSizeHuman` for capacity or `formatThroughputHuman` for throughput). The summary always renders at a fixed centered position and never tries to anchor labels to individual x-axis positions — this keeps the chart readable when the range is narrow.
+- **No-uncertainty fallback:** when Min = Expected = Max the range-bar would have zero width. A minimum visible width (~2% of the x-axis) is drawn around the Expected value so the chart never looks blank.
+
+### Per-model: Capacity
+
+The capacity chart answers "given my adoption and behavior assumptions, how much KV cache storage do I need to provision for this model?"
+
+- **Min** — `calculatePlanEntry` with `totalUsers = totalUsersLow` and `exchangesPerUser = exchangesPerUserLow`; all other inputs (including `concurrentUsers` and `exchangeRatePerHour`) at their Expected values.
+- **Expected** — matches the Plan page's headline KV cache size for this model.
+- **Max** — as Min but with both triples at their High values.
+- **Chart title:** `Capacity — storage for {N} total users × {M} exchanges/user (Expected)`.
+- **Rationale for using both-low / both-high:** `totalUsers` and `exchangesPerUser` multiply in the capacity formula; using both at the extreme gives the correct interval-arithmetic bound. The `concurrentUsers` and `exchangeRatePerHour` triples are irrelevant to capacity and are not consulted for this chart.
+
+### Per-model: Throughput (Write and Read)
+
+The throughput charts answer "at this customer's stated concurrency, what range of throughput do I need to provision?" The concurrent-user count is **held fixed at the Plan-page Expected value**. Uncertainty comes only from the `exchangeRatePerHour` triple.
+
+- **Min** — `calculatePlanEntry` with `concurrentUsers = plan.concurrentUsers` (Expected), `exchangeRatePerHour = exchangeRatePerHourLow`, per-bucket `cacheHitRate` unchanged.
+- **Expected** — same, with `exchangeRatePerHour = exchangeRatePerHour`. Matches the Plan-page headline throughput.
+- **Max** — same, with `exchangeRatePerHour = exchangeRatePerHourHigh`.
+- **Chart title:** `Write throughput — at N concurrent users` or `Read throughput — at N concurrent users`.
+- The `concurrentUsers`, `totalUsers`, and `exchangesPerUser` triples' Low/High values are not consulted for the throughput charts.
+
+### Aggregate card
+
+A single card at the bottom of the page, rolling up all workspace models. Three stacked range-bar charts with the same form as the per-model card:
+
+- **Total capacity** — per-bound sum across all models: `totalMin = Σ model.capacityMin`, `totalExpected = Σ model.capacityExpected`, `totalMax = Σ model.capacityMax`. The Expected value matches the existing Plan-page Aggregate `Total KV cache size`.
+- **Total write throughput** — per-bound sum of per-model write throughput values.
+- **Total read throughput** — per-bound sum of per-model read throughput values.
+
+Sums are performed in the bound direction (low-with-low, expected-with-expected, high-with-high). This implicitly assumes each model's uncertainty is perfectly correlated with the others (e.g., if adoption is low for one it is low for all) — a deliberately conservative-but-wide bound appropriate for sales-conversation "what-if" framing.
 
 ### Empty and edge states
 
-- **No workspace models:** page shows empty state directing the user to the Home page to add a model.
-- **No plan data for a model:** card shows empty state directing the user to the Plan page.
-- **No uncertainty** (the `exchangeRatePerHour` triple's low, expected, and high are all equal): the range bar collapses to zero width. The Expected marker is still drawn, plus a visual fallback (a small filled dot or minimum-width bar) ensures the chart is not blank.
+- **No workspace models:** page shows empty state directing the user to the Home page to add a model. No per-model cards and no aggregate card are rendered.
+- **No plan data for a model:** that per-model card shows an empty state directing the user to the Plan page; the model is excluded from the aggregate roll-up.
+- **All triples flat (no uncertainty):** range bars collapse to their minimum visible width; the Expected marker is still drawn so the Expected value remains visible and readable.

@@ -1,11 +1,12 @@
 // ---------------------------------------------------------------------------
-// Graphs page: visualizes Plan-page data as horizontal range bars showing
-// the Min / Expected / Max throughput required to support a customer-supplied
-// concurrency, where uncertainty comes from the exchangeRatePerHour triple.
+// Graphs page: horizontal range-bar visualizations of capacity and throughput
+// ranges derived from Plan-page scenario triples.
 // ---------------------------------------------------------------------------
 
 function renderGraphsPage(container) {
     const chartInstances = [];
+    const ACCENT = '#D71612';
+    const BYTES_PER_GIB = 1024 ** 3;
 
     function render() {
         container.innerHTML = '';
@@ -18,9 +19,8 @@ function renderGraphsPage(container) {
         const intro = document.createElement('p');
         intro.style.cssText = 'margin: 0 0 16px; color: var(--text-muted); max-width: 780px;';
         intro.textContent =
-            'Throughput range required to support each model at the customer-supplied concurrency. ' +
-            'The bar spans from Min (rate=low) to Max (rate=high) of the Exchange-rate-per-hour triple; ' +
-            'the solid vertical marker inside the bar is the Expected throughput that matches the Plan page.';
+            'Capacity and throughput ranges per workspace model, plus an aggregate roll-up. ' +
+            'Each range bar spans Min to Max; the solid tick is the Expected value (matching the Plan page).';
         container.appendChild(intro);
 
         const workspaceModels = getWorkspaceModels();
@@ -35,13 +35,54 @@ function renderGraphsPage(container) {
 
         const planStore = syncPlanWithWorkspace();
 
+        const perModel = [];
         for (const wsEntry of workspaceModels) {
             const plan = planStore[wsEntry.id];
-            container.appendChild(buildModelGraphCard(wsEntry, plan));
+            const points = plan ? computePoints(plan, wsEntry) : null;
+            perModel.push({ wsEntry, plan, points });
+            container.appendChild(buildModelGraphCard(wsEntry, plan, points));
+        }
+
+        const anyWithPlan = perModel.some(m => m.points);
+        if (anyWithPlan) {
+            container.appendChild(buildAggregateCard(perModel.filter(m => m.points)));
         }
     }
 
-    function buildModelGraphCard(wsEntry, plan) {
+    // Compute capacity + write + read Min/Expected/Max for a single model.
+    // - Capacity varies totalUsers AND exchangesPerUser jointly (both at low,
+    //   both at high) since they multiply in the capacity formula.
+    // - Throughput varies only exchangeRatePerHour; concurrentUsers is held
+    //   at the Plan-page Expected value.
+    function computePoints(plan, wsEntry) {
+        const capMin = safeCalc({ ...plan, totalUsers: plan.totalUsersLow,  exchangesPerUser: plan.exchangesPerUserLow  }, wsEntry);
+        const capExp = safeCalc({ ...plan },                                                                               wsEntry);
+        const capMax = safeCalc({ ...plan, totalUsers: plan.totalUsersHigh, exchangesPerUser: plan.exchangesPerUserHigh }, wsEntry);
+
+        const rMin = safeCalc({ ...plan, exchangeRatePerHour: plan.exchangeRatePerHourLow  }, wsEntry);
+        const rExp = safeCalc({ ...plan },                                                    wsEntry);
+        const rMax = safeCalc({ ...plan, exchangeRatePerHour: plan.exchangeRatePerHourHigh }, wsEntry);
+
+        const toGiB = r => r ? r.totalKVSizeBytes / BYTES_PER_GIB : 0;
+        const toWrite = r => r ? r.totalWriteGiBps : 0;
+        const toRead  = r => r ? r.totalReadGiBps  : 0;
+
+        return {
+            capacity: { min: toGiB(capMin),   expected: toGiB(capExp),   max: toGiB(capMax)   },
+            write:    { min: toWrite(rMin),   expected: toWrite(rExp),   max: toWrite(rMax)   },
+            read:     { min: toRead(rMin),    expected: toRead(rExp),    max: toRead(rMax)    }
+        };
+    }
+
+    function safeCalc(planLike, wsEntry) {
+        try {
+            return calculatePlanEntry(planLike, wsEntry);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function buildModelGraphCard(wsEntry, plan, points) {
         const card = document.createElement('div');
         card.className = 'panel graphs-card';
         card.style.marginBottom = '16px';
@@ -60,7 +101,7 @@ function renderGraphsPage(container) {
         }
         card.appendChild(header);
 
-        if (!plan) {
+        if (!plan || !points) {
             const empty = document.createElement('div');
             empty.style.cssText = 'color: var(--text-muted); font-size: 0.9rem; margin-top: 8px;';
             empty.innerHTML = 'No plan data. Visit the <a href="#plan" style="color: var(--accent);">Plan page</a> to configure this model.';
@@ -68,75 +109,87 @@ function renderGraphsPage(container) {
             return card;
         }
 
-        const points = computePoints(plan, wsEntry);
-
-        const writeWrap = document.createElement('div');
-        writeWrap.className = 'graphs-chart-wrap';
-        const writeCanvas = document.createElement('canvas');
-        writeWrap.appendChild(writeCanvas);
-        card.appendChild(writeWrap);
-        chartInstances.push(buildRangeBarChart(
-            writeCanvas,
+        appendChart(
+            card,
+            points.capacity,
+            `Capacity — ${plan.totalUsers.toLocaleString()} total users × ${plan.exchangesPerUser.toLocaleString()} exchanges/user (Expected)`,
+            'GiB',
+            formatSizeHumanFromGiB
+        );
+        appendChart(
+            card,
             points.write,
-            `Write throughput — at ${plan.concurrentUsers.toLocaleString()} concurrent users`
-        ));
-
-        const readWrap = document.createElement('div');
-        readWrap.className = 'graphs-chart-wrap';
-        const readCanvas = document.createElement('canvas');
-        readWrap.appendChild(readCanvas);
-        card.appendChild(readWrap);
-        chartInstances.push(buildRangeBarChart(
-            readCanvas,
+            `Write throughput — at ${plan.concurrentUsers.toLocaleString()} concurrent users`,
+            'GiB/s',
+            formatThroughputHuman
+        );
+        appendChart(
+            card,
             points.read,
-            `Read throughput — at ${plan.concurrentUsers.toLocaleString()} concurrent users`
-        ));
+            `Read throughput — at ${plan.concurrentUsers.toLocaleString()} concurrent users`,
+            'GiB/s',
+            formatThroughputHuman
+        );
 
         return card;
     }
 
-    // Compute three scalar throughput values (min/expected/max GiB/s) for each
-    // of write and read, holding concurrentUsers fixed at the Plan-page Expected
-    // value and sweeping exchangeRatePerHour across its triple.
-    function computePoints(plan, wsEntry) {
-        const cc = plan.concurrentUsers;
+    function buildAggregateCard(perModelWithPlan) {
+        const sum = (selector) => ({
+            min:      perModelWithPlan.reduce((s, m) => s + selector(m.points).min,      0),
+            expected: perModelWithPlan.reduce((s, m) => s + selector(m.points).expected, 0),
+            max:      perModelWithPlan.reduce((s, m) => s + selector(m.points).max,      0),
+        });
 
-        const rMin = safeCalc({ ...plan, concurrentUsers: cc, exchangeRatePerHour: plan.exchangeRatePerHourLow }, wsEntry);
-        const rExp = safeCalc({ ...plan, concurrentUsers: cc, exchangeRatePerHour: plan.exchangeRatePerHour }, wsEntry);
-        const rMax = safeCalc({ ...plan, concurrentUsers: cc, exchangeRatePerHour: plan.exchangeRatePerHourHigh }, wsEntry);
-
-        const fallback = { totalWriteGiBps: 0, totalReadGiBps: 0 };
-        const min = rMin || fallback;
-        const exp = rExp || fallback;
-        const max = rMax || fallback;
-
-        return {
-            write: { min: min.totalWriteGiBps, expected: exp.totalWriteGiBps, max: max.totalWriteGiBps },
-            read:  { min: min.totalReadGiBps,  expected: exp.totalReadGiBps,  max: max.totalReadGiBps  }
+        const totals = {
+            capacity: sum(p => p.capacity),
+            write:    sum(p => p.write),
+            read:     sum(p => p.read),
         };
+
+        const card = document.createElement('div');
+        card.className = 'panel graphs-card graphs-aggregate-card';
+        card.style.marginBottom = '16px';
+
+        const header = document.createElement('div');
+        header.className = 'plan-card-header';
+        const titleSpan = document.createElement('span');
+        titleSpan.className = 'plan-card-title';
+        titleSpan.textContent = 'Aggregate (all models)';
+        header.appendChild(titleSpan);
+        card.appendChild(header);
+
+        appendChart(card, totals.capacity, 'Total capacity', 'GiB', formatSizeHumanFromGiB);
+        appendChart(card, totals.write,    'Total write throughput', 'GiB/s', formatThroughputHuman);
+        appendChart(card, totals.read,     'Total read throughput',  'GiB/s', formatThroughputHuman);
+
+        return card;
     }
 
-    function safeCalc(planLike, wsEntry) {
-        try {
-            return calculatePlanEntry(planLike, wsEntry);
-        } catch (e) {
-            return null;
-        }
+    function appendChart(card, vals, title, axisUnit, formatter) {
+        const wrap = document.createElement('div');
+        wrap.className = 'graphs-chart-wrap';
+        const canvas = document.createElement('canvas');
+        wrap.appendChild(canvas);
+        card.appendChild(wrap);
+        chartInstances.push(buildRangeBarChart(canvas, vals, title, axisUnit, formatter));
     }
 
-    // Render a horizontal range bar: [Min ──●── Max], with the Expected value
-    // marked by a solid vertical tick and three numeric labels drawn under the
-    // bar. Uses Chart.js "floating bar" (data = [[low, high]]).
-    function buildRangeBarChart(canvas, vals, title) {
+    function formatSizeHumanFromGiB(gib) {
+        // Reuse the Plan-page size formatter, which expects bytes.
+        return formatSizeHuman(gib * BYTES_PER_GIB);
+    }
+
+    // Horizontal range bar with an Expected tick inside the bar and a single
+    // centered summary line "Min … · Expected … · Max …" beneath the chart area.
+    // The centered-summary approach avoids the overlap problem that
+    // positioned-at-x labels have when the range is narrow.
+    function buildRangeBarChart(canvas, vals, title, axisUnit, formatter) {
         const ctx = canvas.getContext('2d');
-        const accent = '#D71612';
 
-        // Axis upper bound: leave 15% headroom above the Max label.
-        const rawMax = Math.max(vals.max, vals.expected, 0);
+        const rawMax = Math.max(vals.max, vals.expected, vals.min, 0);
         const xMax = rawMax > 0 ? rawMax * 1.15 : 1;
 
-        // When Min ≈ Max (no uncertainty) the floating bar renders as zero
-        // width. Widen just enough to be visible so the chart never looks blank.
         const hasRange = (vals.max - vals.min) > xMax * 0.001;
         const barLo = hasRange ? vals.min : Math.max(0, vals.expected - xMax * 0.01);
         const barHi = hasRange ? vals.max : vals.expected + xMax * 0.01;
@@ -151,34 +204,29 @@ function renderGraphsPage(container) {
 
                 // Expected tick
                 const expPx = x.getPixelForValue(vals.expected);
-                c.save();
-                c.strokeStyle = accent;
-                c.lineWidth = 2.5;
-                c.beginPath();
-                c.moveTo(expPx, barTop);
-                c.lineTo(expPx, barBottom);
-                c.stroke();
-                c.restore();
-
-                // Numeric labels under the bar
-                const labelY = barBottom + 14;
-                c.save();
-                c.fillStyle = '#ccc';
-                c.font = '11px sans-serif';
-                c.textBaseline = 'top';
-
-                const labels = [
-                    { x: vals.min,      text: `Min ${formatThroughputHuman(vals.min)}`,       align: 'left'   },
-                    { x: vals.expected, text: `Expected ${formatThroughputHuman(vals.expected)}`, align: 'center' },
-                    { x: vals.max,      text: `Max ${formatThroughputHuman(vals.max)}`,       align: 'right'  }
-                ];
-                for (const lab of labels) {
-                    c.textAlign = lab.align;
-                    const px = x.getPixelForValue(lab.x);
-                    // Clamp label x to keep text inside the chart area
-                    const clamped = Math.min(Math.max(px, chartArea.left + 2), chartArea.right - 2);
-                    c.fillText(lab.text, clamped, labelY);
+                if (expPx >= chartArea.left && expPx <= chartArea.right) {
+                    c.save();
+                    c.strokeStyle = ACCENT;
+                    c.lineWidth = 2.5;
+                    c.beginPath();
+                    c.moveTo(expPx, barTop);
+                    c.lineTo(expPx, barBottom);
+                    c.stroke();
+                    c.restore();
                 }
+
+                // Single centered summary line — always readable regardless of range
+                c.save();
+                c.fillStyle = '#ddd';
+                c.font = '11px sans-serif';
+                c.textAlign = 'center';
+                c.textBaseline = 'top';
+                const summary =
+                    `Min ${formatter(vals.min)}  ·  ` +
+                    `Expected ${formatter(vals.expected)}  ·  ` +
+                    `Max ${formatter(vals.max)}`;
+                const centerX = (chartArea.left + chartArea.right) / 2;
+                c.fillText(summary, centerX, barBottom + 12);
                 c.restore();
             }
         };
@@ -189,8 +237,8 @@ function renderGraphsPage(container) {
                 labels: [''],
                 datasets: [{
                     data: [[barLo, barHi]],
-                    backgroundColor: accent + '33',
-                    borderColor: accent + '99',
+                    backgroundColor: ACCENT + '33',
+                    borderColor: ACCENT + '99',
                     borderWidth: 1,
                     borderSkipped: false,
                     barThickness: 28
@@ -206,9 +254,9 @@ function renderGraphsPage(container) {
                     tooltip: {
                         callbacks: {
                             label: () =>
-                                `Min ${formatThroughputHuman(vals.min)}  |  ` +
-                                `Expected ${formatThroughputHuman(vals.expected)}  |  ` +
-                                `Max ${formatThroughputHuman(vals.max)}`
+                                `Min ${formatter(vals.min)}  |  ` +
+                                `Expected ${formatter(vals.expected)}  |  ` +
+                                `Max ${formatter(vals.max)}`
                         }
                     }
                 },
@@ -216,7 +264,7 @@ function renderGraphsPage(container) {
                     x: {
                         beginAtZero: true,
                         max: xMax,
-                        title: { display: true, text: 'GiB/s', color: '#aaa' },
+                        title: { display: true, text: axisUnit, color: '#aaa' },
                         ticks: { color: '#aaa' },
                         grid: { color: '#333' }
                     },
@@ -225,7 +273,7 @@ function renderGraphsPage(container) {
                         grid: { display: false }
                     }
                 },
-                layout: { padding: { bottom: 24 } } // room for numeric labels drawn under the bar
+                layout: { padding: { bottom: 22 } }
             },
             plugins: [annotations]
         });
