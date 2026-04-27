@@ -66,6 +66,10 @@ The exported JSON contains the workspace (working models with their configs and 
 
 **Import** loads a previously exported JSON file and replaces the current workspace, GPU profiles, cached model configs, and plan data. The HuggingFace token is not affected by import. The application should confirm before importing since it replaces existing data.
 
+### Start new plan
+
+The Settings page includes a **Start new plan** button that resets all per-model planning inputs (server instances, user ranges, distribution buckets, etc.) to their defaults. The button is destructive, so the app prompts for confirmation via a modal dialog before clearing anything. Workspace models, GPU profiles, and cached model configs are not affected — only the plan data stored under `gpu_calc_plan`. After the reset, the Plan page renders default entries (one per workspace model) on next render via `syncPlanWithWorkspace`.
+
 
 ## Home page
 

@@ -205,6 +205,40 @@ function renderSettingsPage(container) {
         dataRow.appendChild(importBtn);
         panel.appendChild(dataRow);
 
+        // Plan data
+        const planLabel = document.createElement('label');
+        planLabel.style.marginTop = '16px';
+        planLabel.textContent = 'Plan data';
+        panel.appendChild(planLabel);
+
+        const planHelp = document.createElement('p');
+        planHelp.style.cssText = 'margin: 2px 0 4px; color: var(--text-muted); font-size: 0.8rem;';
+        planHelp.textContent =
+            'Reset all per-model planning inputs (server instances, user ranges, distribution buckets) to their defaults. ' +
+            'Your workspace models, GPU list, and cached model configs are not affected.';
+        panel.appendChild(planHelp);
+
+        const planRow = document.createElement('div');
+        planRow.className = 'actions';
+        planRow.style.marginTop = '4px';
+
+        const newPlanBtn = document.createElement('button');
+        newPlanBtn.className = 'btn-secondary btn-small';
+        newPlanBtn.textContent = 'Start new plan';
+        newPlanBtn.onclick = async () => {
+            const ok = await confirmDialog(
+                'Start a new plan? This will reset all per-model planning inputs to defaults. ' +
+                'Workspace models, GPUs, and cached model configs are not affected.'
+            );
+            if (!ok) return;
+            localStorage.removeItem(LS_PLAN_KEY);
+            status.textContent = 'Plan data reset to defaults.';
+            status.className = 'status-ok';
+            setTimeout(() => status.textContent = '', 2500);
+        };
+        planRow.appendChild(newPlanBtn);
+        panel.appendChild(planRow);
+
         container.appendChild(panel);
     }
 
