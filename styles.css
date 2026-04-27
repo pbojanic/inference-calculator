@@ -490,6 +490,17 @@ button:disabled {
     margin-bottom: 4px;
 }
 
+.graphs-aggregate-card {
+    border: 2px solid var(--accent);
+    box-shadow: 0 0 0 1px rgba(215, 22, 18, 0.15);
+    margin-bottom: 24px;
+}
+
+.graphs-aggregate-card .plan-card-title {
+    color: var(--accent);
+    font-size: 1.05rem;
+}
+
 /* ===========================================================================
    References page
    =========================================================================== */

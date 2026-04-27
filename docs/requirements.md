@@ -379,12 +379,12 @@ The Graphs page is a dedicated top-level page accessible from the navigation bar
 
 ### Layout
 
-One card per workspace model, in the same order as the Plan page. Each per-model card shows:
+The page's first card is the **Aggregate** card, rolling up all workspace models into three range-bar charts: Total capacity, Total write throughput, Total read throughput. It is visually distinguished from the per-model cards by a 2-pixel accent-colored border (with a subtle outer halo) and a same-color title, so the headline numbers stand out as the first thing a customer sees.
+
+Below the Aggregate card, one per-model card per workspace model appears in the same order as the Plan page. Each per-model card shows:
 
 - The model title (matches the Plan page title).
 - Three stacked range-bar charts: **Capacity (GiB)** on top, then **Write throughput (GiB/s)**, then **Read throughput (GiB/s)**.
-
-Below the per-model cards, a final **Aggregate** card rolls up all workspace models into three corresponding charts: Total capacity, Total write throughput, Total read throughput.
 
 ### Chart form (shared)
 
@@ -414,7 +414,7 @@ The throughput charts show the range of read/write throughput driven by both the
 
 ### Aggregate card
 
-A single card at the bottom of the page, rolling up all workspace models. Three stacked range bars with the same form as the per-model card:
+A single card at the **top** of the page, rolling up all workspace models. Three stacked range bars with the same form as the per-model card. Visually emphasized with an accent-colored border so it reads as the headline.
 
 - **Total capacity** — per-bound sum across all models: `totalLow = Σ model.capacityLow`, `totalHigh = Σ model.capacityHigh`. Matches the Plan-page Aggregate `Total KV cache size` range exactly.
 - **Total write throughput** — per-bound sum of per-model write throughput values.

@@ -56,13 +56,14 @@ function renderGraphsPage(container) {
             };
         }
 
-        // Second pass: render each per-model card with the shared x-axis scale.
-        for (const m of perModel) {
-            container.appendChild(buildModelGraphCard(m.wsEntry, m.plan, m.points, xMaxes));
-        }
-
+        // Aggregate goes at the top so the headline numbers are the first
+        // thing the user sees. Per-model cards follow in workspace order.
         if (aggregate) {
             container.appendChild(buildAggregateCard(aggregate, xMaxes));
+        }
+
+        for (const m of perModel) {
+            container.appendChild(buildModelGraphCard(m.wsEntry, m.plan, m.points, xMaxes));
         }
     }
 
