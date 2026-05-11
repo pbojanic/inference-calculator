@@ -14,12 +14,12 @@ function renderNav(currentPage) {
             </div>
         </div>
         <nav class="nav-bar">
+            <a href="#systems" class="nav-link ${currentPage === 'systems' ? 'active' : ''}">Systems</a>
             <a href="#home" class="nav-link ${currentPage === 'home' ? 'active' : ''}">Models</a>
-            <a href="#gpus" class="nav-link ${currentPage === 'gpus' ? 'active' : ''}">GPUs</a>
             <a href="#plan" class="nav-link ${currentPage === 'plan' ? 'active' : ''}">Plan</a>
             <a href="#graphs" class="nav-link ${currentPage === 'graphs' ? 'active' : ''}">Graphs</a>
-            <a href="#references" class="nav-link ${currentPage === 'references' ? 'active' : ''}">References</a>
             <a href="#settings" class="nav-link ${currentPage === 'settings' ? 'active' : ''}">Settings</a>
+            <a href="#references" class="nav-link ${currentPage === 'references' ? 'active' : ''}">References</a>
         </nav>
     `;
 

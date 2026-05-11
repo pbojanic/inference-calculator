@@ -39,6 +39,13 @@ const Router = {
         }
         if (this._guardActive) return;
 
+        // Legacy hash redirect: the #gpus route was renamed to #systems. An
+        // open tab, bookmark, or back-button entry might still point at the
+        // old hash — silently rewrite the URL without pushing a history entry.
+        if (location.hash === '#gpus') {
+            history.replaceState(null, '', location.pathname + location.search + '#systems');
+        }
+
         const hash = location.hash || '#home';
 
         // Check dirty state for back/forward navigation

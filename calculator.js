@@ -2,56 +2,184 @@
 // All calculations are pure arithmetic, no external dependencies.
 
 // ---------------------------------------------------------------------------
+// Backfill MoE structural fields on a config that predates MoE support.
+// Workspace entries cached before normalizeModelConfig grew MoE awareness
+// still carry the raw HF fields (num_local_experts, n_routed_experts, etc.)
+// but lack the normalized is_moe flag. Re-derive on demand so the
+// architecture-aware calc path is reachable without forcing a re-fetch.
+// Idempotent: when is_moe is already set, returns the input unchanged.
+// ---------------------------------------------------------------------------
+function ensureMoEFields(config) {
+    if (!config || config.is_moe !== undefined) return config;
+    if (typeof normalizeMoEFields !== 'function') return config;
+    return { ...config, ...normalizeMoEFields(config) };
+}
+
+// ---------------------------------------------------------------------------
 // Model parameters — from model_specs.py calculate_model_parameters()
+// MoE-aware: counts ALL experts as resident weights even though only
+// num_experts_per_tok fire per token. Active params are reported separately.
 // ---------------------------------------------------------------------------
 function calculateModelParameters(config) {
+    config = ensureMoEFields(config);
     const hs = config.hidden_size;
     const L = config.num_transformer_layers;
     const H = config.num_attention_heads;
     const G = config.num_kv_heads;
     const D = config.head_dimension;
-    const I = config.intermediate_size;
     const V = config.vocab_size;
     const tieEmb = config.tie_word_embeddings !== false;
     const hiddenAct = (config.hidden_act || "silu").toLowerCase();
+    const isGLU = hiddenAct.includes("glu") || hiddenAct === "silu" || hiddenAct === "swish";
+    const ffnFactor = isGLU ? 3 : 2;
 
-    // Attention: Q, K, V, O projections
+    // Attention: Q, K, V, O projections (per layer)
     const q_proj = hs * (H * D);
     const k_proj = hs * (G * D);
     const v_proj = hs * (G * D);
     const o_proj = (H * D) * hs;
     const attention_params = q_proj + k_proj + v_proj + o_proj;
 
-    // MLP
-    const isGLU = hiddenAct.includes("glu") || hiddenAct === "silu" || hiddenAct === "swish";
-    const mlp_params = isGLU ? 3 * hs * I : 2 * hs * I;
-
-    // Norms (RMSNorm / LayerNorm per layer: attention + MLP)
+    // Norms (RMSNorm/LayerNorm per layer: attention + MLP)
     const norm_params = 2 * hs;
 
-    const per_layer_params = attention_params + mlp_params + norm_params;
     const embedding_params = V * hs;
     const lm_head_params = tieEmb ? 0 : embedding_params;
-    const total_params = per_layer_params * L + embedding_params + lm_head_params;
+
+    const isMoE = !!config.is_moe && (config.num_routed_experts || 0) > 1;
+
+    if (!isMoE) {
+        // Dense path — single FFN block per layer.
+        const I = config.intermediate_size;
+        const mlp_params = ffnFactor * hs * I;
+        const per_layer_params = attention_params + mlp_params + norm_params;
+        const total_params = per_layer_params * L + embedding_params + lm_head_params;
+        return {
+            is_moe: false,
+            attention_params,
+            mlp_params,
+            norm_params,
+            per_layer_params,
+            embedding_params,
+            lm_head_params,
+            total_params,
+            active_params: total_params
+        };
+    }
+
+    // MoE path.
+    const numRouted = config.num_routed_experts;
+    const expertsPerTok = config.num_experts_per_tok || 0;
+    const numShared = config.num_shared_experts || 0;
+    const moeI = config.moe_intermediate_size || config.intermediate_size;
+    const sharedI = config.shared_intermediate_size || 0;
+    const numDense = Math.min(config.num_dense_layers || 0, L);
+    const numMoELayers = L - numDense;
+    const numMtp = config.num_mtp_modules || 0;
+    // Dense-prefix FFN width (DeepSeek convention). MoE configs that don't
+    // have any dense prefix layers may legitimately omit intermediate_size,
+    // so default to 0 to avoid NaN poisoning the totals via 0 * undefined
+    // when numDense === 0.
+    const denseI = config.intermediate_size || 0;
+
+    // Per-expert FFN block.
+    const per_expert_ffn = ffnFactor * hs * moeI;
+
+    // Per-layer FFN totals.
+    const dense_layer_mlp = numDense > 0 ? ffnFactor * hs * denseI : 0;
+    const moe_layer_routed = numRouted * per_expert_ffn;
+    const moe_layer_router = hs * numRouted;
+    const moe_layer_shared = sharedI > 0 ? ffnFactor * hs * sharedI : 0;
+    const moe_layer_mlp = moe_layer_routed + moe_layer_router + moe_layer_shared;
+
+    const per_dense_layer_params = attention_params + dense_layer_mlp + norm_params;
+    const per_moe_layer_params = attention_params + moe_layer_mlp + norm_params;
+
+    const decoder_params =
+        numDense * per_dense_layer_params +
+        numMoELayers * per_moe_layer_params;
+
+    // MTP modules: each is approximately one MoE-style transformer layer plus
+    // an `eh_proj` of size 2*hs*hs that fuses the previous hidden state with
+    // the next-token embedding, plus an extra norm. The lm_head is shared
+    // with the main model so it adds nothing.
+    const eh_proj = 2 * hs * hs;
+    const per_mtp_params = per_moe_layer_params + eh_proj + hs;
+    const mtp_params = numMtp * per_mtp_params;
+
+    const total_params = decoder_params + embedding_params + lm_head_params + mtp_params;
+
+    // Active params per token: attention + norms + (top-k routed + shared
+    // experts + router) per MoE layer, dense FFN for dense layers. MTP
+    // modules don't fire on the standard decode path, so they don't count
+    // toward active.
+    const active_moe_layer_mlp =
+        expertsPerTok * per_expert_ffn + moe_layer_router + moe_layer_shared;
+    const active_per_moe_layer = attention_params + active_moe_layer_mlp + norm_params;
+    const active_decoder =
+        numDense * per_dense_layer_params + numMoELayers * active_per_moe_layer;
+    const active_params = active_decoder + embedding_params + lm_head_params;
 
     return {
+        is_moe: true,
         attention_params,
-        mlp_params,
         norm_params,
-        per_layer_params,
         embedding_params,
         lm_head_params,
-        total_params
+        // MoE structure
+        num_routed_experts: numRouted,
+        num_experts_per_tok: expertsPerTok,
+        num_shared_experts: numShared,
+        num_dense_layers: numDense,
+        num_moe_layers: numMoELayers,
+        num_mtp_modules: numMtp,
+        moe_intermediate_size: moeI,
+        shared_intermediate_size: sharedI,
+        dense_intermediate_size: denseI,
+        // Per-layer breakdowns
+        mlp_dense_layer_params: dense_layer_mlp,
+        mlp_moe_routed_params: moe_layer_routed,
+        mlp_moe_router_params: moe_layer_router,
+        mlp_moe_shared_params: moe_layer_shared,
+        per_dense_layer_params,
+        per_moe_layer_params,
+        decoder_params,
+        mtp_params,
+        // Totals
+        total_params,
+        active_params,
+        // Legacy aliases (so callers that reference these keep working).
+        mlp_params: moe_layer_mlp,
+        per_layer_params: per_moe_layer_params
     };
 }
 
 // ---------------------------------------------------------------------------
 // KV cache memory — from kv_cache_calc.py calculate_kv_cache_memory()
+//
+// Pipeline parallelism (pp): each pipeline stage holds KV only for the
+// ceil(L / pp) layers it owns, so per-rank KV scales by layers-per-stage
+// rather than total layers. Aggregate KV bytes (totalKV) are unchanged —
+// the storage tier still sees the full sum across all stages.
+//
+// KV head sharding under TP:
+//   G >= tp  and  G %  tp === 0   → clean shard, kv_heads_per_gpu = G / tp
+//   G >= tp  and  G %  tp !== 0   → engines typically refuse; we round up
+//                                    (ceil) and flag `kv_uneven_shard` so the
+//                                    UI can warn.
+//   G <  tp                       → KV head cannot shard below 1; engines
+//                                    replicate the head across ALL tp ranks
+//                                    (MLA does this by design). Each rank
+//                                    then holds the FULL KV slice for its
+//                                    stage's layers. Aggregate VRAM consumed
+//                                    by KV is tp × the unique KV.
 // ---------------------------------------------------------------------------
-function calculateKVCacheMemory(config, maxNumSeqs, promptLength, tensorParallel, bytesPerKV) {
+function calculateKVCacheMemory(config, maxNumSeqs, promptLength, tensorParallel, bytesPerKV, pipelineParallel) {
     const L = config.num_transformer_layers;
     const G = config.num_kv_heads;
     const D = config.head_dimension;
+    const pp = pipelineParallel || 1;
+    const tp = tensorParallel || 1;
 
     // Cap effective KV length by sliding_window when present
     const effectiveKVLength = config.sliding_window
@@ -62,17 +190,41 @@ function calculateKVCacheMemory(config, maxNumSeqs, promptLength, tensorParallel
     const kvPerSeq = kvPerSeqPerLayer * L;
     const totalKV = kvPerSeq * maxNumSeqs;
 
-    const kvHeadsPerGPU = Math.floor(G / tensorParallel);
-    const kvPerGPU = 2 * kvHeadsPerGPU * D * effectiveKVLength * bytesPerKV * L * maxNumSeqs;
+    let kvHeadsPerGPU;
+    let kvReplicated = false;
+    let kvUnevenShard = false;
+    if (G < tp) {
+        kvHeadsPerGPU = G;
+        kvReplicated = true;
+    } else if (G % tp === 0) {
+        kvHeadsPerGPU = G / tp;
+    } else {
+        kvHeadsPerGPU = Math.ceil(G / tp);
+        kvUnevenShard = true;
+    }
+
+    const layersPerStage = Math.ceil(L / pp);
+    const kvPerGPU = 2 * kvHeadsPerGPU * D * effectiveKVLength * bytesPerKV * layersPerStage * maxNumSeqs;
+
+    // Aggregate VRAM consumed by KV across all ranks. Without replication
+    // this equals totalKV (per-stage layer slices summed back to the full
+    // model). With replication it's totalKV × tp because every TP rank
+    // carries its own copy of the KV slice for its pipeline stage.
+    const kvVRAMAcrossRanks = kvReplicated ? totalKV * tp : totalKV;
 
     return {
         kv_cache_per_seq_per_layer_bytes: kvPerSeqPerLayer,
         kv_cache_per_seq_bytes: kvPerSeq,
         total_kv_cache_bytes: totalKV,
         kv_cache_per_gpu_bytes: kvPerGPU,
+        kv_vram_across_ranks_bytes: kvVRAMAcrossRanks,
         total_kv_cache_gb: totalKV / (1024 ** 3),
         kv_cache_per_gpu_gb: kvPerGPU / (1024 ** 3),
+        kv_vram_across_ranks_gb: kvVRAMAcrossRanks / (1024 ** 3),
         kv_heads_per_gpu: kvHeadsPerGPU,
+        kv_replicated: kvReplicated,
+        kv_uneven_shard: kvUnevenShard,
+        layers_per_stage: layersPerStage,
         effective_kv_length: effectiveKVLength
     };
 }
@@ -81,19 +233,33 @@ function calculateKVCacheMemory(config, maxNumSeqs, promptLength, tensorParallel
 // Activation memory — from activation_calc.py calculate_activation_memory()
 // ---------------------------------------------------------------------------
 function calculateActivationMemory(config, maxBatchedTokens, tensorParallel, bytesPerElement) {
+    config = ensureMoEFields(config);
     const H = config.num_attention_heads;
     const G = config.num_kv_heads;
     const D = config.head_dimension;
-    const I = config.intermediate_size;
     const hiddenAct = (config.hidden_act || "silu").toLowerCase();
     const isGLU = hiddenAct.includes("glu") || hiddenAct === "silu" || hiddenAct === "swish";
+    const ffnAct = isGLU ? 2 : 1; // gate + up for GLU, just up for non-GLU
+
+    // FFN intermediate width that actually materializes per token. For MoE,
+    // only top-k routed experts fire (plus any shared experts).
+    const isMoE = !!config.is_moe && (config.num_routed_experts || 0) > 1;
+    let I;
+    if (isMoE) {
+        const expertsPerTok = config.num_experts_per_tok || 1;
+        const moeI = config.moe_intermediate_size || config.intermediate_size || 0;
+        const sharedI = config.shared_intermediate_size || 0;
+        I = expertsPerTok * moeI + sharedI;
+    } else {
+        I = config.intermediate_size;
+    }
 
     // Per-token activations (total)
     const q_act = H * D;
     const k_act = G * D;
     const v_act = G * D;
     const attn_scores = H * maxBatchedTokens;
-    const mlp_act = isGLU ? 2 * I : I;
+    const mlp_act = ffnAct * I;
     const act_per_token = q_act + k_act + v_act + attn_scores + mlp_act;
 
     // Per GPU
@@ -105,7 +271,7 @@ function calculateActivationMemory(config, maxBatchedTokens, tensorParallel, byt
     const k_gpu = kvHeadsPerGPU * D;
     const v_gpu = kvHeadsPerGPU * D;
     const attn_gpu = headsPerGPU * maxBatchedTokens;
-    const mlp_gpu = isGLU ? 2 * mlpPerGPU : mlpPerGPU;
+    const mlp_gpu = ffnAct * mlpPerGPU;
     const act_per_token_gpu = q_gpu + k_gpu + v_gpu + attn_gpu + mlp_gpu;
 
     const totalBytes = act_per_token * maxBatchedTokens * bytesPerElement;
@@ -166,7 +332,6 @@ function calculateFrameworkOverhead(gpuMemoryGB, maxNumSeqs, promptLength, tenso
 // ---------------------------------------------------------------------------
 function calculateCompleteAnalysis(params) {
     const {
-        config,
         modelName,
         maxNumSeqs,
         promptLength,
@@ -181,14 +346,20 @@ function calculateCompleteAnalysis(params) {
         showCUDAGraphs,
         showFrameworkOH
     } = params;
+    // Re-derive MoE fields once so downstream calcs and the report formatter
+    // all see the same architecture-aware config (handles legacy cached
+    // configs that predate MoE support).
+    const config = ensureMoEFields(params.config);
+    const pipelineParallel = params.pipelineParallel || 1;
 
-    // Model parameters & weights
+    // Model parameters & weights. With pipeline parallelism, each rank holds
+    // weights for only 1/pp of the layers (in addition to TP's width split).
     const paramBreakdown = calculateModelParameters(config);
     const totalWeightsGB = (paramBreakdown.total_params * bytesPerWeight) / (1024 ** 3);
-    const weightsPerRankGB = totalWeightsGB / tensorParallel;
+    const weightsPerRankGB = totalWeightsGB / (tensorParallel * pipelineParallel);
 
-    // KV cache
-    const kv = calculateKVCacheMemory(config, maxNumSeqs, promptLength, tensorParallel, bytesPerKV);
+    // KV cache — also distributes across pipeline stages.
+    const kv = calculateKVCacheMemory(config, maxNumSeqs, promptLength, tensorParallel, bytesPerKV, pipelineParallel);
 
     // Activations
     const act = calculateActivationMemory(config, maxBatchedTokens, tensorParallel, bytesPerActivation);
@@ -250,6 +421,7 @@ function calculateCompleteAnalysis(params) {
         gpuMemoryGB,
         gpuMemoryUtil,
         tensorParallel,
+        pipelineParallel,
         cufileBufferGB,
         bytesPerWeight,
         bytesPerKV,
@@ -269,16 +441,33 @@ function kvCacheBytesForContext(config, contextSize, bytesPerKV) {
     return result.total_kv_cache_bytes;
 }
 
-// Calculate plan results for one model (includes per-bucket breakdown)
-function calculatePlanEntry(planEntry, workspaceEntry) {
+// Calculate plan results for one model (includes per-bucket breakdown).
+//
+// Inputs:
+//   planEntry: { distribution: [{contextSize, percentage, cacheHitRate}, ...] }
+//   workspaceEntry: workspace model (for config + bytesPerKV)
+//   options: { rps, horizonSeconds, system, systemInstances }
+//     - rps: aggregate requests/sec at the chosen scenario (Average or Peak)
+//     - horizonSeconds: planning horizon in seconds; capacity = writes/s × this
+//     - system: assigned system { readBandwidthGiBps, writeBandwidthGiBps, ... }
+//       (may be null/undefined when the workspace has no system assigned)
+//     - systemInstances: count of physical systems running this model
+//
+// Throughput is NOT multiplied by systemInstances when computing demand —
+// `rps` is the aggregate system rate. The system bandwidth IS multiplied by
+// systemInstances since each system contributes its own bandwidth lane.
+// Capacity is unbounded (no per-bucket cap).
+function calculatePlanEntry(planEntry, workspaceEntry, options) {
     const config = workspaceEntry.config;
     const bytesPerKV = (workspaceEntry.deployment && workspaceEntry.deployment.bytesPerKV) || 2;
+    const rps = options ? (options.rps || 0) : 0;
+    const horizonSeconds = options ? (options.horizonSeconds || 0) : 0;
+    const system = options ? options.system : null;
+    const systemInstances = options ? (options.systemInstances || 0) : 0;
 
     let totalKVSizeBytes = 0;
-    let totalWriteBytesPerSec = 0;
-    let totalReadBytesPerSec = 0;
-
-    const exchangeRatePerSec = planEntry.exchangeRatePerHour / 3600;
+    let totalWriteDemandBytesPerSec = 0;
+    let totalReadDemandBytesPerSec = 0;
     const bucketDetails = [];
 
     for (const bucket of planEntry.distribution) {
@@ -286,63 +475,117 @@ function calculatePlanEntry(planEntry, workspaceEntry) {
         const hitFrac = bucket.cacheHitRate / 100;
         const kvBytes = kvCacheBytesForContext(config, bucket.contextSize, bytesPerKV);
 
-        // Size: based on total users, NOT multiplied by server instances (shared storage)
-        const bucketExchanges = planEntry.totalUsers * planEntry.exchangesPerUser * pFrac;
-        const bucketSizeBytes = bucketExchanges * kvBytes;
-        totalKVSizeBytes += bucketSizeBytes;
+        const bucketRequestsPerSec = rps * pFrac;
+        const bucketWritesPerSec = bucketRequestsPerSec * (1 - hitFrac);
+        const bucketReadsPerSec = bucketRequestsPerSec * hitFrac;
 
-        // Throughput: based on concurrent users × server instances
-        const bucketExchangesPerSec = planEntry.serverInstances * planEntry.concurrentUsers * exchangeRatePerSec * pFrac;
-        const bucketWriteBytes = bucketExchangesPerSec * (1 - hitFrac) * kvBytes;
-        const bucketReadBytes = bucketExchangesPerSec * hitFrac * kvBytes;
-        totalWriteBytesPerSec += bucketWriteBytes;
-        totalReadBytesPerSec += bucketReadBytes;
+        const bucketWriteBytes = bucketWritesPerSec * kvBytes;
+        const bucketReadBytes = bucketReadsPerSec * kvBytes;
+        totalWriteDemandBytesPerSec += bucketWriteBytes;
+        totalReadDemandBytesPerSec += bucketReadBytes;
+
+        // Capacity = sustained write bytes/sec × horizon. Cache hits don't
+        // add new storage (re-reads of existing entries).
+        const bucketSizeBytes = bucketWriteBytes * horizonSeconds;
+        totalKVSizeBytes += bucketSizeBytes;
 
         bucketDetails.push({
             contextSize: bucket.contextSize,
             percentage: bucket.percentage,
             cacheHitRate: bucket.cacheHitRate,
             kvBytesPerSeq: kvBytes,
-            exchanges: bucketExchanges,
-            sizeBytes: bucketSizeBytes,
-            exchangesPerSec: bucketExchangesPerSec,
+            requestsPerSec: bucketRequestsPerSec,
+            writesPerSec: bucketWritesPerSec,
+            readsPerSec: bucketReadsPerSec,
             writeBytesPerSec: bucketWriteBytes,
-            readBytesPerSec: bucketReadBytes
+            readBytesPerSec: bucketReadBytes,
+            sizeBytes: bucketSizeBytes
         });
     }
 
+    // System bandwidth caps — single numbers (not ranged on rps scenario).
+    // When no system or zero instances, caps are 0 → achievable also 0.
+    const writeBwGiBps = system ? (system.writeBandwidthGiBps || 0) : 0;
+    const readBwGiBps  = system ? (system.readBandwidthGiBps  || 0) : 0;
+    const writeBandwidthBytesPerSec = systemInstances * writeBwGiBps * (1024 ** 3);
+    const readBandwidthBytesPerSec  = systemInstances * readBwGiBps  * (1024 ** 3);
+
+    const writeAchievableBytesPerSec = Math.min(totalWriteDemandBytesPerSec, writeBandwidthBytesPerSec);
+    const readAchievableBytesPerSec  = Math.min(totalReadDemandBytesPerSec,  readBandwidthBytesPerSec);
+
+    const GIB = 1024 ** 3;
     return {
+        // Capacity (unbounded — no system cap).
         totalKVSizeBytes,
-        totalWriteBytesPerSec,
-        totalReadBytesPerSec,
-        totalKVSizeGiB: totalKVSizeBytes / (1024 ** 3),
-        totalWriteGiBps: totalWriteBytesPerSec / (1024 ** 3),
-        totalReadGiBps: totalReadBytesPerSec / (1024 ** 3),
+        totalKVSizeGiB: totalKVSizeBytes / GIB,
+        // Throughput demand — what the workload would push if uncapped.
+        totalWriteBytesPerSec: totalWriteDemandBytesPerSec,
+        totalReadBytesPerSec: totalReadDemandBytesPerSec,
+        totalWriteGiBps: totalWriteDemandBytesPerSec / GIB,
+        totalReadGiBps:  totalReadDemandBytesPerSec  / GIB,
+        // System bandwidth — what the system can sustain.
+        writeBandwidthBytesPerSec,
+        readBandwidthBytesPerSec,
+        writeBandwidthGiBps: writeBandwidthBytesPerSec / GIB,
+        readBandwidthGiBps:  readBandwidthBytesPerSec  / GIB,
+        // Achievable — min(demand, bandwidth).
+        writeAchievableBytesPerSec,
+        readAchievableBytesPerSec,
+        writeAchievableGiBps: writeAchievableBytesPerSec / GIB,
+        readAchievableGiBps:  readAchievableBytesPerSec  / GIB,
+        // Capping flags
+        writeCapped: totalWriteDemandBytesPerSec > writeBandwidthBytesPerSec + 1e-6,
+        readCapped:  totalReadDemandBytesPerSec  > readBandwidthBytesPerSec  + 1e-6,
         bucketDetails,
-        // Echo inputs used in calculation for the detail view
-        totalUsers: planEntry.totalUsers,
-        exchangesPerUser: planEntry.exchangesPerUser,
-        serverInstances: planEntry.serverInstances,
-        concurrentUsers: planEntry.concurrentUsers,
-        exchangeRatePerHour: planEntry.exchangeRatePerHour
+        rps,
+        horizonSeconds,
+        systemInstances,
+        systemRef: system || null
     };
 }
 
-// Aggregate plan results across all models
+// Aggregate plan results across all models. Sums demand, system bandwidth,
+// and achievable; the capacity gap is `max(0, demand − bandwidth)`.
 function calculatePlanRollup(results) {
-    let totalSize = 0, totalWrite = 0, totalRead = 0;
+    let totalSize = 0;
+    let totalWriteDemand = 0, totalReadDemand = 0;
+    let totalWriteBw = 0,    totalReadBw  = 0;
+    let totalWriteAch = 0,   totalReadAch = 0;
     for (const r of results) {
-        totalSize += r.totalKVSizeBytes;
-        totalWrite += r.totalWriteBytesPerSec;
-        totalRead += r.totalReadBytesPerSec;
+        totalSize        += r.totalKVSizeBytes;
+        totalWriteDemand += r.totalWriteBytesPerSec;
+        totalReadDemand  += r.totalReadBytesPerSec;
+        totalWriteBw     += r.writeBandwidthBytesPerSec || 0;
+        totalReadBw      += r.readBandwidthBytesPerSec  || 0;
+        totalWriteAch    += r.writeAchievableBytesPerSec || 0;
+        totalReadAch     += r.readAchievableBytesPerSec  || 0;
     }
+    const GIB = 1024 ** 3;
+    const writeGap = Math.max(0, totalWriteDemand - totalWriteBw);
+    const readGap  = Math.max(0, totalReadDemand  - totalReadBw);
     return {
         totalKVSizeBytes: totalSize,
-        totalWriteBytesPerSec: totalWrite,
-        totalReadBytesPerSec: totalRead,
-        totalKVSizeGiB: totalSize / (1024 ** 3),
-        totalWriteGiBps: totalWrite / (1024 ** 3),
-        totalReadGiBps: totalRead / (1024 ** 3)
+        totalKVSizeGiB:   totalSize / GIB,
+        // Demand (uncapped)
+        totalWriteBytesPerSec: totalWriteDemand,
+        totalReadBytesPerSec:  totalReadDemand,
+        totalWriteGiBps: totalWriteDemand / GIB,
+        totalReadGiBps:  totalReadDemand  / GIB,
+        // Bandwidth (sum of per-model caps)
+        writeBandwidthBytesPerSec: totalWriteBw,
+        readBandwidthBytesPerSec:  totalReadBw,
+        writeBandwidthGiBps: totalWriteBw / GIB,
+        readBandwidthGiBps:  totalReadBw  / GIB,
+        // Achievable
+        writeAchievableBytesPerSec: totalWriteAch,
+        readAchievableBytesPerSec:  totalReadAch,
+        writeAchievableGiBps: totalWriteAch / GIB,
+        readAchievableGiBps:  totalReadAch  / GIB,
+        // Capacity gap
+        writeGapBytesPerSec: writeGap,
+        readGapBytesPerSec:  readGap,
+        writeGapGiBps: writeGap / GIB,
+        readGapGiBps:  readGap  / GIB
     };
 }
 
@@ -385,7 +628,22 @@ function formatReport(r) {
     lines.push(`KV heads: ${r.config.num_kv_heads}`);
     lines.push(`Hidden size: ${r.config.hidden_size}`);
     lines.push(`Head dimension: ${r.config.head_dimension}`);
-    lines.push(`Intermediate size: ${r.config.intermediate_size}`);
+    if (r.paramBreakdown.is_moe) {
+        lines.push(`Architecture: Mixture of Experts`);
+        lines.push(`Routed experts: ${r.paramBreakdown.num_routed_experts} (top-${r.paramBreakdown.num_experts_per_tok || '?'} per token)`);
+        if (r.paramBreakdown.num_shared_experts > 0) {
+            lines.push(`Shared experts: ${r.paramBreakdown.num_shared_experts} (width ${r.paramBreakdown.shared_intermediate_size})`);
+        }
+        lines.push(`Per-expert intermediate size: ${r.paramBreakdown.moe_intermediate_size}`);
+        if (r.paramBreakdown.num_dense_layers > 0) {
+            lines.push(`Dense prefix layers: ${r.paramBreakdown.num_dense_layers} (intermediate size ${r.paramBreakdown.dense_intermediate_size})`);
+        }
+        if (r.paramBreakdown.num_mtp_modules > 0) {
+            lines.push(`MTP modules: ${r.paramBreakdown.num_mtp_modules}`);
+        }
+    } else {
+        lines.push(`Intermediate size: ${r.config.intermediate_size}`);
+    }
     lines.push(`Vocab size: ${r.config.vocab_size}`);
     lines.push(`Max position embeddings: ${(r.config.max_position_embeddings || "N/A").toLocaleString()}`);
     if (r.config.sliding_window) {
@@ -406,6 +664,10 @@ function formatReport(r) {
     lines.push(`Sequence length: ${r.promptLength.toLocaleString()}`);
     lines.push(`Max batched tokens: ${r.maxBatchedTokens.toLocaleString()}`);
     lines.push(`Tensor parallel: ${r.tensorParallel}`);
+    if ((r.pipelineParallel || 1) > 1) {
+        lines.push(`Pipeline parallel: ${r.pipelineParallel} (\u2248 ${r.kv.layers_per_stage} layers/stage)`);
+        lines.push(`GPUs per model instance: ${r.tensorParallel * r.pipelineParallel} (TP \u00d7 PP)`);
+    }
     lines.push(`GPU memory: ${r.gpuMemoryGB.toFixed(1)} GB`);
     lines.push(`GPU memory utilization: ${(r.gpuMemoryUtil * 100).toFixed(0)}%`);
     lines.push(`cuFile buffer: ${r.cufileBufferGB.toFixed(1)} GB`);
@@ -414,8 +676,22 @@ function formatReport(r) {
     lines.push("");
     lines.push("MODEL MEMORY");
     lines.push(`Parameters: ${r.paramBreakdown.total_params.toLocaleString()}`);
+    if (r.paramBreakdown.is_moe) {
+        lines.push(`Active per token: ${r.paramBreakdown.active_params.toLocaleString()} (${(r.paramBreakdown.active_params / r.paramBreakdown.total_params * 100).toFixed(1)}%)`);
+        lines.push(`  Routed FFN per layer: ${r.paramBreakdown.num_routed_experts} experts \u00d7 ${(r.paramBreakdown.mlp_moe_routed_params / r.paramBreakdown.num_routed_experts).toLocaleString()} = ${r.paramBreakdown.mlp_moe_routed_params.toLocaleString()}`);
+        if (r.paramBreakdown.mlp_moe_shared_params > 0) {
+            lines.push(`  Shared FFN per layer: ${r.paramBreakdown.mlp_moe_shared_params.toLocaleString()}`);
+        }
+        lines.push(`  Router per layer: ${r.paramBreakdown.mlp_moe_router_params.toLocaleString()}`);
+        if (r.paramBreakdown.mtp_params > 0) {
+            lines.push(`  MTP modules: ${r.paramBreakdown.mtp_params.toLocaleString()}`);
+        }
+    }
+    const pp = r.pipelineParallel || 1;
+    const splitLabel = pp > 1 ? `TP=${r.tensorParallel}, PP=${pp}` : `TP=${r.tensorParallel}`;
+    const splitDenom = r.tensorParallel * pp;
     lines.push(`Total weights: ${r.totalWeightsGB.toFixed(2)} GB`);
-    lines.push(`Per rank @TP=${r.tensorParallel}: ${r.weightsPerRankGB.toFixed(2)} GB`);
+    lines.push(`Per rank @${splitLabel}: ${r.weightsPerRankGB.toFixed(2)} GB`);
 
     // KV cache
     lines.push("");
@@ -424,11 +700,25 @@ function formatReport(r) {
     if (r.config.sliding_window && r.kv.effective_kv_length !== r.promptLength) {
         lines.push(`Effective KV length: min(${r.promptLength.toLocaleString()}, ${r.config.sliding_window.toLocaleString()}) = ${r.kv.effective_kv_length.toLocaleString()} (capped by sliding window)`);
     }
-    lines.push(`Per sequence: 2 x ${r.config.num_kv_heads} x ${r.config.head_dimension} x ${r.kv.effective_kv_length.toLocaleString()} x ${r.bytesPerKV} bytes = ${r.kv.kv_cache_per_seq_bytes.toLocaleString()} bytes`);
+    lines.push(`Per sequence: 2 x ${r.config.num_kv_heads} x ${r.config.head_dimension} x ${r.kv.effective_kv_length.toLocaleString()} x ${r.bytesPerKV} bytes \u00d7 ${r.config.num_transformer_layers} layers = ${r.kv.kv_cache_per_seq_bytes.toLocaleString()} bytes`);
     lines.push(`All sequences: ${r.kv.kv_cache_per_seq_bytes.toLocaleString()} x ${r.maxNumSeqs} = ${r.kv.total_kv_cache_bytes.toLocaleString()} bytes`);
-    lines.push(`Tensor parallel: ${r.config.num_kv_heads} KV heads / ${r.tensorParallel} = ${r.kv.kv_heads_per_gpu} heads per rank`);
-    lines.push(`Per rank: ${r.kv.kv_cache_per_gpu_bytes.toLocaleString()} bytes = ${r.kv.kv_cache_per_gpu_gb.toFixed(1)} GB`);
-    lines.push(`Total across ranks: ${r.kv.kv_cache_per_gpu_gb.toFixed(1)} GB x ${r.tensorParallel} = ${r.kv.total_kv_cache_gb.toFixed(1)} GB`);
+    if (r.kv.kv_replicated) {
+        lines.push(`Tensor parallel: ${r.config.num_kv_heads} KV heads < TP=${r.tensorParallel} \u2014 KV REPLICATED across all ${r.tensorParallel} TP ranks (cannot shard below 1 head)`);
+    } else if (r.kv.kv_uneven_shard) {
+        lines.push(`Tensor parallel: ${r.config.num_kv_heads} KV heads / ${r.tensorParallel} = ${r.kv.kv_heads_per_gpu} heads per rank (UNEVEN \u2014 not divisible; most engines refuse this)`);
+    } else {
+        lines.push(`Tensor parallel: ${r.config.num_kv_heads} KV heads / ${r.tensorParallel} = ${r.kv.kv_heads_per_gpu} heads per rank`);
+    }
+    if (pp > 1) {
+        lines.push(`Pipeline parallel: ${r.config.num_transformer_layers} layers / ${pp} stages = ${r.kv.layers_per_stage} layers per rank`);
+    }
+    lines.push(`Per rank: ${r.kv.kv_cache_per_gpu_bytes.toLocaleString()} bytes = ${r.kv.kv_cache_per_gpu_gb.toFixed(2)} GB${r.kv.kv_replicated ? ' (replicated copy)' : ''}`);
+    if (r.kv.kv_replicated) {
+        lines.push(`VRAM across all ${splitDenom} ranks: ${(r.kv.kv_cache_per_gpu_gb * splitDenom).toFixed(2)} GB (= per-rank \u00d7 ${splitDenom} due to replication)`);
+        lines.push(`Unique KV (storage tier): ${r.kv.total_kv_cache_gb.toFixed(2)} GB (one logical copy)`);
+    } else {
+        lines.push(`Total across ranks: ${r.kv.total_kv_cache_gb.toFixed(2)} GB (aggregate, sums to one full KV across all ${splitDenom} ranks)`);
+    }
 
     // Memory breakdown — two zones
     lines.push("");
@@ -436,8 +726,8 @@ function formatReport(r) {
     lines.push(`Total GPU Memory: ${r.gpuMemoryGB.toFixed(1)} GB`);
     lines.push("");
     lines.push(`\u250C\u2500 vLLM Budget (--gpu-memory-utilization ${(r.gpuMemoryUtil * 100).toFixed(0)}%): ${r.vllmAllocated.toFixed(1)} GB`);
-    lines.push(`\u2502  \u251C\u2500 Model Weights: ${r.weightsPerRankGB.toFixed(1)} GB (SPLIT: ${r.totalWeightsGB.toFixed(1)}GB / ${r.tensorParallel})`);
-    lines.push(`\u2502  \u251C\u2500 KV Cache: ${r.kv.kv_cache_per_gpu_gb.toFixed(1)} GB (SPLIT: ${r.kv.total_kv_cache_gb.toFixed(1)}GB / ${r.tensorParallel})`);
+    lines.push(`\u2502  \u251C\u2500 Model Weights: ${r.weightsPerRankGB.toFixed(1)} GB (SPLIT: ${r.totalWeightsGB.toFixed(1)}GB / ${splitDenom})`);
+    lines.push(`\u2502  \u251C\u2500 KV Cache: ${r.kv.kv_cache_per_gpu_gb.toFixed(1)} GB (per-stage: ${r.kv.layers_per_stage} of ${r.config.num_transformer_layers} layers)`);
     lines.push(`\u2502  \u251C\u2500 Activations: ${r.act.activation_per_gpu_gb.toFixed(1)} GB (SPLIT: ${r.act.total_activation_gb.toFixed(1)}GB / ${r.tensorParallel})`);
     lines.push(`\u2502  \u2514\u2500 Available for KV growth: ${r.vllmAvailable.toFixed(1)} GB`);
     lines.push("");

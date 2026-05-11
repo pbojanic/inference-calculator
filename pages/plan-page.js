@@ -1,12 +1,27 @@
 // ---------------------------------------------------------------------------
 // Plan page: capacity planning for inference workloads
-// Calculates KV cache storage size and IO throughput (GiB/s)
+//
+// Inputs are framed in inference-DC vocabulary:
+//   - global planning horizon (days)
+//   - per-model system instances (count of physical systems)
+//   - per-model aggregate requests/sec (Average / Peak scenarios)
+//   - per-model context-size distribution with cache hit rates
+//
+// Capacity = sustained writes × horizon (no system cap on storage).
+// Throughput = aggregate rps split by hit rate, capped at
+// `systemInstances × system.bandwidth` independently for read and write.
+// Server-side fleet sizing reasoning lives entirely in the system concept;
+// `serverInstances` from the v2 schema is gone.
 // ---------------------------------------------------------------------------
 
 const LS_PLAN_KEY = 'gpu_calc_plan';
+// v3: serverInstances → systemInstances, depends on workspace systemId, and
+// throughput capping at system bandwidth. v2 plan data is warn-and-reset.
+const PLAN_VERSION = 3;
+const DEFAULT_PLANNING_HORIZON_DAYS = 30;
+const SECONDS_PER_DAY = 86400;
 
-// Context size presets for distribution buckets — log-spaced, each mapped to a
-// recognizable use case so a sales engineer can pick a realistic workload.
+// Context size presets for distribution buckets.
 const CONTEXT_PRESETS = [
     { value: 512,     label: '512 · Short Q&A',  title: 'Single query / FAQ' },
     { value: 2048,    label: '2K · Chat',        title: 'Standard chat turn' },
@@ -24,122 +39,146 @@ function formatContextTokens(n) {
     return `${n}`;
 }
 
+function _defaultPlanData() {
+    return {
+        planningHorizonDays: DEFAULT_PLANNING_HORIZON_DAYS,
+        entries: {}
+    };
+}
+
 function _getPlanStore() {
-    const raw = localStorage.getItem(LS_PLAN_KEY);
-    if (!raw) return {};
-    return JSON.parse(raw);
+    return loadVersionedPayload(
+        LS_PLAN_KEY, PLAN_VERSION,
+        _defaultPlanData,
+        'Plan data',
+        { silentUpgrade: false }
+    );
 }
 
 function _savePlanStore(store) {
-    localStorage.setItem(LS_PLAN_KEY, JSON.stringify(store));
+    saveVersionedPayload(LS_PLAN_KEY, PLAN_VERSION, store);
 }
 
 function defaultPlanEntry(workspaceId) {
     return {
         workspaceId,
-        serverInstances: 1,
-        totalUsersLow: 100,
-        totalUsersHigh: 100,
-        concurrentUsersLow: 10,
-        concurrentUsersHigh: 10,
-        exchangesPerUserLow: 50,
-        exchangesPerUserHigh: 50,
-        exchangeRatePerHourLow: 10,
-        exchangeRatePerHourHigh: 10,
+        systemInstances: 1,
+        rpsAverage: 1.0,
+        rpsPeak: 1.0,
         distribution: [
             { contextSize: 500, percentage: 100, cacheHitRate: 0 }
         ]
     };
 }
 
-// Sync plan store with current workspace: remove orphans, add defaults for new models
+// Sync plan store with current workspace.
 function syncPlanWithWorkspace() {
     const workspaceModels = getWorkspaceModels();
     const wsIds = new Set(workspaceModels.map(m => m.id));
     const store = _getPlanStore();
 
-    // Remove orphaned entries
-    for (const id of Object.keys(store)) {
-        if (!wsIds.has(id)) delete store[id];
+    if (!store.entries) store.entries = {};
+    if (typeof store.planningHorizonDays !== 'number' || store.planningHorizonDays <= 0) {
+        store.planningHorizonDays = DEFAULT_PLANNING_HORIZON_DAYS;
     }
 
-    // Add defaults for new models
+    for (const id of Object.keys(store.entries)) {
+        if (!wsIds.has(id)) delete store.entries[id];
+    }
     for (const model of workspaceModels) {
-        if (!store[model.id]) {
-            store[model.id] = defaultPlanEntry(model.id);
+        if (!store.entries[model.id]) {
+            store.entries[model.id] = defaultPlanEntry(model.id);
         }
-    }
-
-    // Migrate older plans. Two historical shapes are possible:
-    //   1. Single point estimate per input (pre-triples): seed low and high to the point.
-    //   2. Triple {low, expected, high}: keep low/high and drop the Expected field.
-    // After migration only `*Low` and `*High` fields remain.
-    for (const plan of Object.values(store)) {
-        if (plan.totalUsersLow === undefined) plan.totalUsersLow = plan.totalUsers ?? 100;
-        if (plan.totalUsersHigh === undefined) plan.totalUsersHigh = plan.totalUsers ?? 100;
-        if (plan.concurrentUsersLow === undefined) plan.concurrentUsersLow = plan.concurrentUsers ?? 10;
-        if (plan.concurrentUsersHigh === undefined) plan.concurrentUsersHigh = plan.concurrentUsers ?? 10;
-        if (plan.exchangesPerUserLow === undefined) plan.exchangesPerUserLow = plan.exchangesPerUser ?? 50;
-        if (plan.exchangesPerUserHigh === undefined) plan.exchangesPerUserHigh = plan.exchangesPerUser ?? 50;
-        if (plan.exchangeRatePerHourLow === undefined) plan.exchangeRatePerHourLow = plan.exchangeRatePerHour ?? 10;
-        if (plan.exchangeRatePerHourHigh === undefined) plan.exchangeRatePerHourHigh = plan.exchangeRatePerHour ?? 10;
-        delete plan.totalUsers;
-        delete plan.concurrentUsers;
-        delete plan.exchangesPerUser;
-        delete plan.exchangeRatePerHour;
     }
 
     _savePlanStore(store);
     return store;
 }
 
-// Get the max allowed context size for a workspace entry
-// Bounded by the user's configured sequence length, not by sliding window
-// (sliding window caps KV cache size per layer, not the sequence length)
 function getMaxContextForEntry(entry) {
     const dep = entry.deployment;
     return (dep && dep.seqLen) || entry.config.max_position_embeddings || 131072;
 }
 
+// Helpers for derived deployment shape. With pipeline parallelism, one
+// model instance spans `tp \u00d7 pp` GPUs — possibly across multiple systems
+// when pp > 1. The "instances per system" notion only really applies when
+// pp === 1; for pp > 1 the spread spans systems, and the meaningful number
+// is total model instances across the available GPU pool.
+function gpusPerInstance(wsEntry) {
+    const dep = wsEntry.deployment || {};
+    return (dep.tp || 1) * (dep.pp || 1);
+}
+
+function instancesPerSystem(wsEntry) {
+    const dep = wsEntry.deployment || {};
+    const sys = getSystem(dep.systemId);
+    if (!sys) return 0;
+    const pp = dep.pp || 1;
+    if (pp > 1) return 0; // multi-system spread; not a per-system count
+    const tp = dep.tp || 1;
+    return Math.floor(sys.gpuCount / tp);
+}
+
+function totalGpus(plan, wsEntry) {
+    const sys = getSystem(wsEntry.deployment && wsEntry.deployment.systemId);
+    if (!sys) return 0;
+    return plan.systemInstances * sys.gpuCount;
+}
+
+function totalModelInstances(plan, wsEntry) {
+    const total = totalGpus(plan, wsEntry);
+    const per = gpusPerInstance(wsEntry);
+    if (per <= 0) return 0;
+    return Math.floor(total / per);
+}
+
+function planCardTitle(wsEntry) {
+    const dep = wsEntry.deployment || {};
+    const sys = getSystem(dep.systemId);
+    const tp = dep.tp || 1;
+    const pp = dep.pp || 1;
+    const parallelism = pp > 1 ? `TP=${tp}, PP=${pp}` : `TP=${tp}`;
+    const sysName = sys ? sys.name : 'no system';
+    return `${wsEntry.title} (${parallelism}) on ${sysName}`;
+}
+
 // Validate a plan entry against its workspace entry. Returns array of error strings.
-function validatePlanEntry(plan, maxContext) {
+function validatePlanEntry(plan, wsEntry, maxContext) {
     const errors = [];
+    const dep = wsEntry.deployment || {};
+    const sys = getSystem(dep.systemId);
 
-    if (!Number.isInteger(plan.serverInstances) || plan.serverInstances < 1)
-        errors.push('Server instances must be at least 1');
+    if (!Number.isInteger(plan.systemInstances) || plan.systemInstances < 1)
+        errors.push('System instances must be at least 1');
 
-    // Scenario-range validation: each fuzzy input is a {low, high} pair.
-    if (!Number.isInteger(plan.totalUsersLow) || plan.totalUsersLow < 1)
-        errors.push('Total users (low) must be a positive integer');
-    if (!Number.isInteger(plan.totalUsersHigh) || plan.totalUsersHigh < 1)
-        errors.push('Total users (high) must be a positive integer');
-    if (plan.totalUsersLow > plan.totalUsersHigh)
-        errors.push('Total users: low must not exceed high');
+    if (!sys) {
+        errors.push('Workspace model has no system assigned — open it in Model Details and pick a system.');
+    } else {
+        const tp = dep.tp || 1;
+        const pp = dep.pp || 1;
+        if (tp > sys.gpuCount) {
+            errors.push(`TP=${tp} exceeds ${sys.name}'s ${sys.gpuCount} GPUs (fix on Model Details page). Each pipeline stage must fit within one system.`);
+        }
+        // Combined TP \u00d7 PP must fit in the total GPU pool (systemInstances \u00d7 gpuCount).
+        const totalGpusAvailable = (Number.isInteger(plan.systemInstances) && plan.systemInstances > 0)
+            ? plan.systemInstances * sys.gpuCount
+            : 0;
+        const perInstance = tp * pp;
+        if (totalGpusAvailable > 0 && perInstance > totalGpusAvailable) {
+            errors.push(`TP\u00d7PP = ${tp}\u00d7${pp} = ${perInstance} GPUs/instance exceeds the ${totalGpusAvailable} GPUs available across ${plan.systemInstances}\u00d7 ${sys.name}. Increase System instances or reduce TP/PP.`);
+        }
+        if (perInstance > 0 && totalGpusAvailable > 0 && Math.floor(totalGpusAvailable / perInstance) < 1) {
+            errors.push(`Cannot fit a model instance: TP\u00d7PP = ${perInstance} > ${totalGpusAvailable} available GPUs.`);
+        }
+    }
 
-    if (!Number.isInteger(plan.concurrentUsersLow) || plan.concurrentUsersLow < 1)
-        errors.push('Concurrent users (low) must be a positive integer');
-    if (!Number.isInteger(plan.concurrentUsersHigh) || plan.concurrentUsersHigh < 1)
-        errors.push('Concurrent users (high) must be a positive integer');
-    if (plan.concurrentUsersLow > plan.concurrentUsersHigh)
-        errors.push('Concurrent users: low must not exceed high');
-    if (plan.concurrentUsersLow > plan.totalUsersLow)
-        errors.push('Concurrent users (low) cannot exceed Total users (low)');
-    if (plan.concurrentUsersHigh > plan.totalUsersHigh)
-        errors.push('Concurrent users (high) cannot exceed Total users (high)');
-
-    if (!Number.isInteger(plan.exchangesPerUserLow) || plan.exchangesPerUserLow < 1)
-        errors.push('Exchanges per user (low) must be a positive integer');
-    if (!Number.isInteger(plan.exchangesPerUserHigh) || plan.exchangesPerUserHigh < 1)
-        errors.push('Exchanges per user (high) must be a positive integer');
-    if (plan.exchangesPerUserLow > plan.exchangesPerUserHigh)
-        errors.push('Exchanges per user: low must not exceed high');
-
-    if (typeof plan.exchangeRatePerHourLow !== 'number' || plan.exchangeRatePerHourLow <= 0)
-        errors.push('Exchange rate (low) must be greater than 0');
-    if (typeof plan.exchangeRatePerHourHigh !== 'number' || plan.exchangeRatePerHourHigh <= 0)
-        errors.push('Exchange rate (high) must be greater than 0');
-    if (plan.exchangeRatePerHourLow > plan.exchangeRatePerHourHigh)
-        errors.push('Exchange rate: low must not exceed high');
+    if (typeof plan.rpsAverage !== 'number' || plan.rpsAverage <= 0)
+        errors.push('Requests/sec (Average) must be greater than 0');
+    if (typeof plan.rpsPeak !== 'number' || plan.rpsPeak <= 0)
+        errors.push('Requests/sec (Peak) must be greater than 0');
+    if (plan.rpsAverage > plan.rpsPeak)
+        errors.push('Requests/sec: Average must not exceed Peak');
 
     const pctSum = plan.distribution.reduce((s, b) => s + b.percentage, 0);
     if (Math.abs(pctSum - 100) > 0.01)
@@ -163,45 +202,44 @@ function validatePlanEntry(plan, maxContext) {
     return errors;
 }
 
+function validatePlanHorizon(days) {
+    if (!Number.isInteger(days) || days < 1) return ['Planning horizon must be a positive integer (days)'];
+    return [];
+}
+
 
 // ---------------------------------------------------------------------------
 // Page renderer
 // ---------------------------------------------------------------------------
 function renderPlanPage(container) {
-    let planData = {};       // working copy (unsaved)
-    let savedData = {};      // last saved snapshot
+    let planData = _defaultPlanData();
+    let savedData = _defaultPlanData();
     let debounceTimer = null;
 
-    // Stable DOM references for live-updating outputs (no full re-render needed)
-    // Keyed by workspace model ID
-    const cardOutputs = {};  // { wsId: { resultsDiv, errorsDiv, detailsDiv, pctSumCell, kvCells[], ctxInputs[] } }
+    const cardOutputs = {};
     let rollupPanel = null;
-    let rollupDetailsDiv = null;
     let showDetailsCheckbox = null;
     let saveBtnRef = null;
+    let saveStatusRef = null;
+    let horizonErrorsDiv = null;
 
     function loadData() {
         savedData = syncPlanWithWorkspace();
         planData = JSON.parse(JSON.stringify(savedData));
     }
 
-    function markDirty() {
-        State.setDirty(true);
-    }
+    function markDirty() { State.setDirty(true); }
 
-    // -----------------------------------------------------------------------
-    // Full render — only called on initial load, add/remove bucket, cancel
-    // -----------------------------------------------------------------------
     function render() {
         container.innerHTML = '';
         Object.keys(cardOutputs).forEach(k => delete cardOutputs[k]);
         rollupPanel = null;
-        rollupDetailsDiv = null;
         saveBtnRef = null;
+        saveStatusRef = null;
+        horizonErrorsDiv = null;
 
         const workspaceModels = getWorkspaceModels();
 
-        // Empty state
         if (workspaceModels.length === 0) {
             const empty = document.createElement('div');
             empty.className = 'empty-state';
@@ -215,13 +253,14 @@ function renderPlanPage(container) {
         title.textContent = 'Capacity Plan';
         container.appendChild(title);
 
+        container.appendChild(buildHorizonPanel());
+
         for (const wsEntry of workspaceModels) {
-            const plan = planData[wsEntry.id];
+            const plan = planData.entries[wsEntry.id];
             if (!plan) continue;
             container.appendChild(buildModelCard(wsEntry, plan));
         }
 
-        // Show details toggle
         const toggleRow = document.createElement('div');
         toggleRow.className = 'toggle-row';
         toggleRow.style.marginTop = '12px';
@@ -236,17 +275,10 @@ function renderPlanPage(container) {
         toggleRow.appendChild(toggleLabel);
         container.appendChild(toggleRow);
 
-        // Roll-up placeholder
         rollupPanel = document.createElement('div');
         rollupPanel.className = 'panel plan-rollup';
         container.appendChild(rollupPanel);
 
-        // Roll-up details placeholder
-        rollupDetailsDiv = document.createElement('div');
-        rollupDetailsDiv.className = 'plan-details';
-        rollupPanel.appendChild(rollupDetailsDiv);
-
-        // Save / Cancel buttons
         const actions = document.createElement('div');
         actions.className = 'actions';
         actions.style.marginTop = '16px';
@@ -262,6 +294,17 @@ function renderPlanPage(container) {
         saveBtnRef = saveBtn;
         actions.appendChild(saveBtn);
 
+        // Inline status text next to Save. When the plan has unresolved
+        // validation issues we don't block Save (a sales engineer is
+        // allowed to save a work-in-progress plan with known shortfalls
+        // and revisit later). Instead we surface the count here so the
+        // user sees what they're saving past. The per-card red error
+        // lines stay as-is.
+        const saveStatus = document.createElement('span');
+        saveStatus.style.cssText = 'margin-left: 12px; font-size: 0.8rem; color: var(--text-muted);';
+        saveStatusRef = saveStatus;
+        actions.appendChild(saveStatus);
+
         const cancelBtn = document.createElement('button');
         cancelBtn.className = 'btn-secondary';
         cancelBtn.textContent = 'Cancel';
@@ -274,33 +317,77 @@ function renderPlanPage(container) {
 
         container.appendChild(actions);
 
-        // Initial calculation update
         updateOutputs();
     }
 
+    function buildHorizonPanel() {
+        const panel = document.createElement('div');
+        panel.className = 'panel';
+        panel.style.marginBottom = '12px';
+
+        const label = document.createElement('label');
+        label.textContent = 'Planning horizon (days)';
+        label.style.fontWeight = '600';
+
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = 1;
+        input.step = 1;
+        input.value = planData.planningHorizonDays;
+        input.style.maxWidth = '120px';
+        input.oninput = () => {
+            const v = parseInt(input.value);
+            if (!isNaN(v)) {
+                planData.planningHorizonDays = v;
+                markDirty();
+                scheduleRecalc();
+            }
+        };
+        label.appendChild(input);
+        panel.appendChild(label);
+
+        const help = document.createElement('p');
+        help.style.cssText = 'margin: 6px 0 0; color: var(--text-muted); font-size: 0.8rem;';
+        help.textContent =
+            'How long KV cache is retained in shared storage. Drives capacity sizing only; ' +
+            'doubling the horizon doubles the storage requirement at 0% hit rate.';
+        panel.appendChild(help);
+
+        horizonErrorsDiv = document.createElement('div');
+        horizonErrorsDiv.style.marginTop = '4px';
+        panel.appendChild(horizonErrorsDiv);
+
+        return panel;
+    }
+
     // -----------------------------------------------------------------------
-    // Lightweight output update — updates results, errors, KV cells, rollup
-    // without touching inputs or rebuilding the DOM
+    // Update outputs
     // -----------------------------------------------------------------------
     function updateOutputs() {
         const showDetails = showDetailsCheckbox ? showDetailsCheckbox.checked : false;
         const workspaceModels = getWorkspaceModels();
         const allResults = [];
-        let hasErrors = false;
+        let totalErrorCount = 0;
+
+        const horizonErrors = validatePlanHorizon(planData.planningHorizonDays);
+        if (horizonErrorsDiv) {
+            horizonErrorsDiv.innerHTML = horizonErrors.map(e => `<div class="status-err">${e}</div>`).join('');
+        }
+        totalErrorCount += horizonErrors.length;
+        const horizonSeconds = (planData.planningHorizonDays || 0) * SECONDS_PER_DAY;
 
         for (const wsEntry of workspaceModels) {
-            const plan = planData[wsEntry.id];
+            const plan = planData.entries[wsEntry.id];
             const refs = cardOutputs[wsEntry.id];
             if (!plan || !refs) continue;
 
             const maxCtx = getMaxContextForEntry(wsEntry);
-            const errors = validatePlanEntry(plan, maxCtx);
-            if (errors.length > 0) hasErrors = true;
+            const errors = validatePlanEntry(plan, wsEntry, maxCtx);
+            totalErrorCount += errors.length;
 
-            // Update errors div
             refs.errorsDiv.innerHTML = errors.map(e => `<div class="status-err">${e}</div>`).join('');
 
-            // Update percentage sum
+            // % sum
             const pctSum = plan.distribution.reduce((s, b) => s + b.percentage, 0);
             const sumOk = Math.abs(pctSum - 100) < 0.01;
             refs.pctSumCell.className = sumOk ? 'status-ok' : 'status-err';
@@ -308,7 +395,7 @@ function renderPlanPage(container) {
             refs.pctSumCell.style.fontWeight = '600';
             refs.pctSumCell.textContent = `Sum: ${pctSum.toFixed(1)}%${sumOk ? '' : ' (must be 100%)'}`;
 
-            // Update KV cache per sequence cells
+            // KV cache per-seq cells
             const bytesPerKV = (wsEntry.deployment && wsEntry.deployment.bytesPerKV) || 2;
             for (let i = 0; i < plan.distribution.length; i++) {
                 const cell = refs.kvCells[i];
@@ -321,93 +408,71 @@ function renderPlanPage(container) {
                 }
             }
 
-            // Update context size input borders
+            // Context-size border highlight
             for (let i = 0; i < plan.distribution.length; i++) {
                 const input = refs.ctxInputs[i];
                 if (!input) continue;
                 input.style.borderColor = plan.distribution[i].contextSize > maxCtx ? '#F04E23' : '';
             }
 
-            // Update derived GPU count readout next to Server instances input
-            const tp = (wsEntry.deployment && wsEntry.deployment.tp) || 1;
-            const gpus = plan.serverInstances * tp;
-            if (refs.gpuCountSpan) {
-                refs.gpuCountSpan.textContent = tp > 1
-                    ? `→ ${gpus} GPUs (TP=${tp})`
-                    : `→ ${gpus} GPUs`;
-            }
+            // Refresh card title (workspace title may have changed)
+            if (refs.titleSpan) refs.titleSpan.textContent = planCardTitle(wsEntry);
 
-            // Calculate both bounds (Low and High) and render each result
-            // as a range.
-            const resultLow = calcAtBound(plan, wsEntry, 'Low');
-            const resultHigh = calcAtBound(plan, wsEntry, 'High');
+            // Derived deployment readout
+            updateDerivedReadout(refs.derivedSpan, plan, wsEntry);
 
-            if (resultLow && resultHigh) {
-                allResults.push({ resultLow, resultHigh, wsEntry, plan, gpus, tp });
-                refs.resultsDiv.innerHTML = `
-                    <div class="plan-result-row">
-                        <span class="plan-result-label">KV Cache Size:</span>
-                        <span class="plan-result-value">${formatRangeSize(resultLow.totalKVSizeBytes, resultHigh.totalKVSizeBytes)}</span>
-                    </div>
-                    <div class="plan-result-row">
-                        <span class="plan-result-label">Write Throughput:</span>
-                        <span class="plan-result-value">${formatRangeThroughput(resultLow.totalWriteGiBps, resultHigh.totalWriteGiBps)}</span>
-                    </div>
-                    <div class="plan-result-row">
-                        <span class="plan-result-label">Read Throughput:</span>
-                        <span class="plan-result-value">${formatRangeThroughput(resultLow.totalReadGiBps, resultHigh.totalReadGiBps)}</span>
-                    </div>
-                `;
-                refs.detailsDiv.innerHTML = showDetails ? buildDetailHTML(resultLow, resultHigh, plan, wsEntry) : '';
+            // Calculate at both scenarios
+            const sys = getSystem(wsEntry.deployment && wsEntry.deployment.systemId);
+            const resultAvg  = calcAtScenario(plan, wsEntry, 'Average', horizonSeconds, sys);
+            const resultPeak = calcAtScenario(plan, wsEntry, 'Peak',    horizonSeconds, sys);
+
+            if (resultAvg && resultPeak) {
+                allResults.push({ resultAvg, resultPeak, wsEntry, plan, sys });
+                refs.resultsDiv.innerHTML = buildResultsHTML(resultAvg, resultPeak, plan, wsEntry, sys);
+                refs.detailsDiv.innerHTML = showDetails ? buildDetailHTML(resultAvg, resultPeak, plan, wsEntry, horizonSeconds) : '';
             } else {
                 refs.resultsDiv.innerHTML = '';
                 refs.detailsDiv.innerHTML = '';
             }
         }
 
-        // Update roll-up
+        // Roll-up
         if (rollupPanel) {
             if (allResults.length > 0) {
-                const rollupLow = calculatePlanRollup(allResults.map(r => r.resultLow));
-                const rollupHigh = calculatePlanRollup(allResults.map(r => r.resultHigh));
-                const totalGpus = allResults.reduce((s, r) => s + r.gpus, 0);
-                let rollupHTML = `
-                    <h2 style="margin-top: 0;">Aggregate</h2>
-                    <div class="plan-result-row">
-                        <span class="plan-result-label">Total GPUs:</span>
-                        <span class="plan-result-value">${totalGpus}</span>
-                    </div>
-                    <div class="plan-result-row">
-                        <span class="plan-result-label">Total KV Cache Size:</span>
-                        <span class="plan-result-value">${formatRangeSize(rollupLow.totalKVSizeBytes, rollupHigh.totalKVSizeBytes)}</span>
-                    </div>
-                    <div class="plan-result-row">
-                        <span class="plan-result-label">Total Write Throughput:</span>
-                        <span class="plan-result-value">${formatRangeThroughput(rollupLow.totalWriteGiBps, rollupHigh.totalWriteGiBps)}</span>
-                    </div>
-                    <div class="plan-result-row">
-                        <span class="plan-result-label">Total Read Throughput:</span>
-                        <span class="plan-result-value">${formatRangeThroughput(rollupLow.totalReadGiBps, rollupHigh.totalReadGiBps)}</span>
-                    </div>
-                `;
+                const rollupAvg  = calculatePlanRollup(allResults.map(r => r.resultAvg));
+                const rollupPeak = calculatePlanRollup(allResults.map(r => r.resultPeak));
+                rollupPanel.innerHTML = buildRollupHTML(allResults, rollupAvg, rollupPeak);
                 if (showDetails) {
-                    rollupHTML += '<div class="plan-details">' + buildRollupDetailHTML(allResults) + '</div>';
+                    const detailsDiv = document.createElement('div');
+                    detailsDiv.className = 'plan-details';
+                    detailsDiv.innerHTML = buildRollupDetailHTML(allResults);
+                    rollupPanel.appendChild(detailsDiv);
                 }
-                rollupPanel.innerHTML = rollupHTML;
                 rollupPanel.style.display = '';
             } else {
                 rollupPanel.style.display = 'none';
             }
         }
 
-        // Update save button state
-        if (saveBtnRef) {
-            saveBtnRef.disabled = hasErrors;
+        // Save is never blocked by validation issues — a sales engineer is
+        // free to save a partial / aspirational plan and revisit. We only
+        // surface the unresolved-issue count alongside the button so they
+        // see what they're carrying forward. Errors recompute on next load
+        // (they're derived from inputs), so reopening a saved plan
+        // re-highlights the same issues automatically.
+        if (saveStatusRef) {
+            if (totalErrorCount > 0) {
+                saveStatusRef.textContent = `\u26a0 ${totalErrorCount} unresolved validation issue${totalErrorCount === 1 ? '' : 's'} \u2014 Save will persist as-is.`;
+                saveStatusRef.style.color = 'var(--accent, #F04E23)';
+            } else {
+                saveStatusRef.textContent = '';
+                saveStatusRef.style.color = '';
+            }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Model card — builds the full card with stable output references
+    // Per-model card
     // -----------------------------------------------------------------------
     function buildModelCard(wsEntry, plan) {
         const maxCtx = getMaxContextForEntry(wsEntry);
@@ -415,69 +480,31 @@ function renderPlanPage(container) {
         const card = document.createElement('div');
         card.className = 'panel plan-card';
 
-        // Header
         const header = document.createElement('div');
         header.className = 'plan-card-header';
         const titleSpan = document.createElement('span');
         titleSpan.className = 'plan-card-title';
-        titleSpan.textContent = wsEntry.title;
+        titleSpan.textContent = planCardTitle(wsEntry);
         header.appendChild(titleSpan);
-        if (wsEntry.title !== wsEntry.baseModel) {
-            const base = document.createElement('span');
-            base.className = 'plan-card-base';
-            base.textContent = wsEntry.baseModel;
-            header.appendChild(base);
-        }
         card.appendChild(header);
 
-        // Input fields row
         const inputRow = document.createElement('div');
         inputRow.className = 'plan-inputs-row';
 
-        const serverInstancesField = buildNumberField('Server instances', plan.serverInstances, 1, null, true, v => {
-            plan.serverInstances = v; markDirty(); scheduleRecalc();
+        const sysInstancesField = buildNumberField('System instances', plan.systemInstances, 1, null, true, v => {
+            plan.systemInstances = v; markDirty(); scheduleRecalc();
         });
-        const gpuCountSpan = document.createElement('span');
-        gpuCountSpan.className = 'gpu-count-display';
-        serverInstancesField.appendChild(gpuCountSpan);
-        inputRow.appendChild(serverInstancesField);
-        inputRow.appendChild(buildRangeField(
-            'Total users',
-            plan.totalUsersLow, plan.totalUsersHigh,
-            true,
+        const derivedSpan = document.createElement('span');
+        derivedSpan.className = 'gpu-count-display';
+        sysInstancesField.appendChild(derivedSpan);
+        inputRow.appendChild(sysInstancesField);
+
+        inputRow.appendChild(buildScenarioRangeField(
+            'Requests/sec',
+            plan.rpsAverage, plan.rpsPeak,
             (which, v) => {
-                if (which === 'low') plan.totalUsersLow = v;
-                else plan.totalUsersHigh = v;
-                markDirty(); scheduleRecalc();
-            }
-        ));
-        inputRow.appendChild(buildRangeField(
-            'Concurrent users',
-            plan.concurrentUsersLow, plan.concurrentUsersHigh,
-            true,
-            (which, v) => {
-                if (which === 'low') plan.concurrentUsersLow = v;
-                else plan.concurrentUsersHigh = v;
-                markDirty(); scheduleRecalc();
-            }
-        ));
-        inputRow.appendChild(buildRangeField(
-            'Exchanges/user',
-            plan.exchangesPerUserLow, plan.exchangesPerUserHigh,
-            true,
-            (which, v) => {
-                if (which === 'low') plan.exchangesPerUserLow = v;
-                else plan.exchangesPerUserHigh = v;
-                markDirty(); scheduleRecalc();
-            }
-        ));
-        inputRow.appendChild(buildRangeField(
-            'Rate/hr/user',
-            plan.exchangeRatePerHourLow, plan.exchangeRatePerHourHigh,
-            false,
-            (which, v) => {
-                if (which === 'low') plan.exchangeRatePerHourLow = v;
-                else plan.exchangeRatePerHourHigh = v;
+                if (which === 'avg') plan.rpsAverage = v;
+                else plan.rpsPeak = v;
                 markDirty(); scheduleRecalc();
             }
         ));
@@ -487,7 +514,6 @@ function renderPlanPage(container) {
         // Distribution table
         const distSection = document.createElement('div');
         distSection.style.marginTop = '12px';
-
         const distHeader = document.createElement('h3');
         distHeader.textContent = 'Input Token Distribution';
         distHeader.style.marginBottom = '6px';
@@ -499,14 +525,13 @@ function renderPlanPage(container) {
         const thead = document.createElement('thead');
         thead.innerHTML = `<tr>
             <th>Context Size</th>
-            <th>% of Exchanges</th>
+            <th>% of Requests</th>
             <th>Cache Hit Rate %</th>
             <th>KV Cache/seq</th>
             <th></th>
         </tr>`;
         table.appendChild(thead);
 
-        // Track output cells per row
         const kvCells = [];
         const ctxInputs = [];
 
@@ -519,7 +544,6 @@ function renderPlanPage(container) {
         }
         table.appendChild(tbody);
 
-        // Footer: percentage sum (stable reference)
         const tfoot = document.createElement('tfoot');
         const sumRow = document.createElement('tr');
         const emptyTd = document.createElement('td');
@@ -534,7 +558,6 @@ function renderPlanPage(container) {
 
         distSection.appendChild(table);
 
-        // Add bucket button
         const addBucketBtn = document.createElement('button');
         addBucketBtn.className = 'btn-secondary btn-small';
         addBucketBtn.textContent = 'Add Bucket';
@@ -542,41 +565,72 @@ function renderPlanPage(container) {
         addBucketBtn.onclick = () => {
             plan.distribution.push({ contextSize: 1000, percentage: 0, cacheHitRate: 0 });
             markDirty();
-            render(); // full re-render needed for structural change
+            render();
         };
         distSection.appendChild(addBucketBtn);
 
         card.appendChild(distSection);
 
-        // Errors placeholder (stable reference)
         const errorsDiv = document.createElement('div');
         errorsDiv.style.marginTop = '8px';
         card.appendChild(errorsDiv);
 
-        // Results placeholder (stable reference)
         const resultsDiv = document.createElement('div');
         resultsDiv.className = 'plan-results';
         card.appendChild(resultsDiv);
 
-        // Calculation details placeholder (stable reference, shown via toggle)
         const detailsDiv = document.createElement('div');
         detailsDiv.className = 'plan-details';
         card.appendChild(detailsDiv);
 
-        // Store stable output references
-        cardOutputs[wsEntry.id] = { resultsDiv, errorsDiv, detailsDiv, pctSumCell, kvCells, ctxInputs, gpuCountSpan };
+        cardOutputs[wsEntry.id] = {
+            titleSpan, resultsDiv, errorsDiv, detailsDiv,
+            pctSumCell, kvCells, ctxInputs, derivedSpan
+        };
 
         return card;
     }
 
-    // -----------------------------------------------------------------------
-    // Distribution row — returns { tr, kvCell, ctxInput } for output tracking
-    // -----------------------------------------------------------------------
+    function updateDerivedReadout(span, plan, wsEntry) {
+        if (!span) return;
+        const dep = wsEntry.deployment || {};
+        const sys = getSystem(dep.systemId);
+        const tp = dep.tp || 1;
+        const pp = dep.pp || 1;
+        if (!sys) {
+            span.textContent = '\u2192 no system assigned';
+            return;
+        }
+        const totGpus = totalGpus(plan, wsEntry);
+        const totModels = totalModelInstances(plan, wsEntry);
+        const perInstance = tp * pp;
+
+        if (tp > sys.gpuCount) {
+            span.textContent = `\u2192 TP=${tp} > ${sys.gpuCount} GPUs (each stage must fit one system)`;
+            return;
+        }
+        if (perInstance > totGpus) {
+            span.textContent = `\u2192 TP\u00d7PP = ${perInstance} > ${totGpus} available GPUs (need more system instances)`;
+            return;
+        }
+
+        if (pp > 1) {
+            // Multi-stage spread across systems (or within a large system).
+            span.textContent =
+                `\u2192 ${plan.systemInstances}\u00d7 ${sys.name} = ${totGpus} GPUs ` +
+                `(TP=${tp} \u00d7 PP=${pp} = ${perInstance} GPUs/instance, ${totModels} model instance${totModels === 1 ? '' : 's'})`;
+        } else {
+            const ips = instancesPerSystem(wsEntry);
+            span.textContent =
+                `\u2192 ${plan.systemInstances}\u00d7 ${sys.name} = ${totGpus} GPUs ` +
+                `(TP=${tp}, ${ips} instance${ips === 1 ? '' : 's'}/sys, ${totModels} model instance${totModels === 1 ? '' : 's'})`;
+        }
+    }
+
     function buildDistRow(plan, idx, maxCtx, wsEntry) {
         const bucket = plan.distribution[idx];
         const tr = document.createElement('tr');
 
-        // Context size
         const tdCtx = document.createElement('td');
         const ctxInput = document.createElement('input');
         ctxInput.type = 'number';
@@ -589,8 +643,6 @@ function renderPlanPage(container) {
             markDirty(); scheduleRecalc();
         };
 
-        // Preset chip row — fills the input on click; chips over the model's
-        // max context render disabled with a tooltip explaining the limit.
         const presetRow = document.createElement('div');
         presetRow.className = 'context-preset-row';
         for (const preset of CONTEXT_PRESETS) {
@@ -615,7 +667,6 @@ function renderPlanPage(container) {
         tdCtx.appendChild(ctxInput);
         tr.appendChild(tdCtx);
 
-        // Percentage
         const tdPct = document.createElement('td');
         const pctInput = document.createElement('input');
         pctInput.type = 'number';
@@ -630,7 +681,6 @@ function renderPlanPage(container) {
         tdPct.appendChild(pctInput);
         tr.appendChild(tdPct);
 
-        // Cache hit rate
         const tdHit = document.createElement('td');
         const hitInput = document.createElement('input');
         hitInput.type = 'number';
@@ -645,13 +695,11 @@ function renderPlanPage(container) {
         tdHit.appendChild(hitInput);
         tr.appendChild(tdHit);
 
-        // KV cache per sequence (read-only output cell)
         const kvCell = document.createElement('td');
         kvCell.style.fontSize = '0.8rem';
         kvCell.style.color = 'var(--text-muted)';
         tr.appendChild(kvCell);
 
-        // Remove button
         const tdRm = document.createElement('td');
         const rmBtn = document.createElement('button');
         rmBtn.className = 'btn-danger btn-small';
@@ -660,7 +708,7 @@ function renderPlanPage(container) {
         rmBtn.onclick = () => {
             plan.distribution.splice(idx, 1);
             markDirty();
-            render(); // full re-render for structural change
+            render();
         };
         tdRm.appendChild(rmBtn);
         tr.appendChild(tdRm);
@@ -669,7 +717,7 @@ function renderPlanPage(container) {
     }
 
     // -----------------------------------------------------------------------
-    // Number input field builder
+    // Field builders
     // -----------------------------------------------------------------------
     function buildNumberField(labelText, value, min, max, isInt, onChange) {
         const wrapper = document.createElement('label');
@@ -688,150 +736,244 @@ function renderPlanPage(container) {
         return wrapper;
     }
 
-    // Range (low / high) field builder. onChange receives (which, value)
-    // where which is 'low' | 'high'.
-    function buildRangeField(labelText, lowValue, highValue, isInt, onChange) {
+    function buildScenarioRangeField(labelText, avgValue, peakValue, onChange) {
         const wrapper = document.createElement('label');
         wrapper.textContent = labelText;
         const row = document.createElement('div');
         row.className = 'plan-range';
 
-        const makeInput = (value, which, title) => {
+        const makeInput = (value, which, title, placeholder) => {
             const input = document.createElement('input');
             input.type = 'number';
             input.value = value;
-            input.min = isInt ? 1 : 0.1;
-            input.step = isInt ? 1 : 0.1;
+            input.min = 0.001;
+            input.step = 0.1;
             input.title = title;
+            input.placeholder = placeholder;
             input.oninput = () => {
-                const v = isInt ? parseInt(input.value) : parseFloat(input.value);
+                const v = parseFloat(input.value);
                 if (!isNaN(v)) onChange(which, v);
             };
             return input;
         };
 
-        row.appendChild(makeInput(lowValue, 'low', 'Low / conservative'));
-        row.appendChild(makeInput(highValue, 'high', 'High / aggressive'));
+        row.appendChild(makeInput(avgValue,  'avg',  'Average — steady-state load',     'Avg'));
+        row.appendChild(makeInput(peakValue, 'peak', 'Peak — busiest sustained period', 'Peak'));
         wrapper.appendChild(row);
         return wrapper;
     }
 
     // -----------------------------------------------------------------------
-    // Scenario-range helpers
+    // Scenario helpers
     // -----------------------------------------------------------------------
-
-    // Build a point-estimate plan object for a given bound ('Low' or 'High')
-    // suitable for passing to calculator.js functions that expect the legacy
-    // single-value field names (totalUsers, concurrentUsers, etc.).
-    function planAtBound(plan, bound) {
-        return {
-            ...plan,
-            totalUsers: plan[`totalUsers${bound}`],
-            concurrentUsers: plan[`concurrentUsers${bound}`],
-            exchangesPerUser: plan[`exchangesPerUser${bound}`],
-            exchangeRatePerHour: plan[`exchangeRatePerHour${bound}`]
-        };
+    function rpsForScenario(plan, scenario) {
+        return scenario === 'Average' ? plan.rpsAverage : plan.rpsPeak;
     }
 
-    function calcAtBound(plan, wsEntry, bound) {
+    function calcAtScenario(plan, wsEntry, scenario, horizonSeconds, sys) {
         try {
-            return calculatePlanEntry(planAtBound(plan, bound), wsEntry);
+            const rps = rpsForScenario(plan, scenario);
+            return calculatePlanEntry(plan, wsEntry, {
+                rps,
+                horizonSeconds,
+                system: sys,
+                systemInstances: plan.systemInstances
+            });
         } catch (e) {
             return null;
         }
     }
 
-    function formatRangeSize(lowBytes, highBytes) {
-        if (Math.abs(highBytes - lowBytes) < 1) return formatSizeHuman(lowBytes);
-        return `${formatSizeHuman(lowBytes)} – ${formatSizeHuman(highBytes)}`;
+    function fmtRangeSize(avgBytes, peakBytes) {
+        if (Math.abs(peakBytes - avgBytes) < 1) return formatSizeHuman(avgBytes);
+        return `${formatSizeHuman(avgBytes)} – ${formatSizeHuman(peakBytes)}`;
     }
-
-    function formatRangeThroughput(lowGiBps, highGiBps) {
-        if (Math.abs(highGiBps - lowGiBps) < 1e-9) return formatThroughputHuman(lowGiBps);
-        return `${formatThroughputHuman(lowGiBps)} – ${formatThroughputHuman(highGiBps)}`;
+    function fmtRangeTp(avg, peak) {
+        if (Math.abs(peak - avg) < 1e-9) return formatThroughputHuman(avg);
+        return `${formatThroughputHuman(avg)} – ${formatThroughputHuman(peak)}`;
     }
-
-    function formatRangeCount(lowN, highN) {
-        const lo = Math.round(lowN).toLocaleString();
-        const hi = Math.round(highN).toLocaleString();
-        return lo === hi ? lo : `${lo} – ${hi}`;
-    }
-
-    function formatRangeFloat(lowN, highN, decimals = 3) {
-        const lo = lowN.toFixed(decimals);
-        const hi = highN.toFixed(decimals);
-        return lo === hi ? lo : `${lo} – ${hi}`;
+    function fmtRangeFloat(avg, peak, decimals = 3) {
+        const a = avg.toFixed(decimals);
+        const b = peak.toFixed(decimals);
+        return a === b ? a : `${a} – ${b}`;
     }
 
     // -----------------------------------------------------------------------
-    // Detail breakdown HTML for a single model — renders both bounds in parallel
+    // Per-model results HTML — shows demand + system cap; achievable line
+    // appears only when capping kicks in.
     // -----------------------------------------------------------------------
-    function buildDetailHTML(resultLow, resultHigh, plan, wsEntry) {
+    function buildResultsHTML(resultAvg, resultPeak, plan, wsEntry, sys) {
+        const writeCapped = resultAvg.writeCapped || resultPeak.writeCapped;
+        const readCapped  = resultAvg.readCapped  || resultPeak.readCapped;
+        const sysLabel = sys ? `(${plan.systemInstances}× ${sys.name})` : '(no system)';
+
+        const writeDemand = fmtRangeTp(resultAvg.totalWriteGiBps, resultPeak.totalWriteGiBps);
+        const readDemand  = fmtRangeTp(resultAvg.totalReadGiBps,  resultPeak.totalReadGiBps);
+        const writeCap    = formatThroughputHuman(resultAvg.writeBandwidthGiBps);
+        const readCap     = formatThroughputHuman(resultAvg.readBandwidthGiBps);
+        const writeAch    = fmtRangeTp(resultAvg.writeAchievableGiBps, resultPeak.writeAchievableGiBps);
+        const readAch     = fmtRangeTp(resultAvg.readAchievableGiBps,  resultPeak.readAchievableGiBps);
+
+        const cap = (label) => `<span class="status-err" style="font-weight: 600;">${label}</span>`;
+
+        const writeBlock = `
+            <div class="plan-throughput-block">
+                <div class="plan-throughput-title">
+                    Write throughput${writeCapped ? ' ' + cap('⚠ capped') : ''}
+                </div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">Demand:</span><span>${writeDemand}</span></div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">System cap:</span><span>${writeCap} ${sysLabel}</span></div>
+                ${writeCapped ? `<div class="plan-throughput-row"><span class="plan-throughput-label">Achievable:</span><span>${writeAch}</span></div>` : ''}
+            </div>
+        `;
+        const readBlock = `
+            <div class="plan-throughput-block">
+                <div class="plan-throughput-title">
+                    Read throughput${readCapped ? ' ' + cap('⚠ capped') : ''}
+                </div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">Demand:</span><span>${readDemand}</span></div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">System cap:</span><span>${readCap} ${sysLabel}</span></div>
+                ${readCapped ? `<div class="plan-throughput-row"><span class="plan-throughput-label">Achievable:</span><span>${readAch}</span></div>` : ''}
+            </div>
+        `;
+
+        return `
+            <div class="plan-result-row">
+                <span class="plan-result-label">KV Cache Size:</span>
+                <span class="plan-result-value">${fmtRangeSize(resultAvg.totalKVSizeBytes, resultPeak.totalKVSizeBytes)}</span>
+            </div>
+            ${writeBlock}
+            ${readBlock}
+        `;
+    }
+
+    // -----------------------------------------------------------------------
+    // Roll-up HTML
+    // -----------------------------------------------------------------------
+    function buildRollupHTML(allResults, rollupAvg, rollupPeak) {
+        // System mix grouped by name → "2× DGX H100, 1× GB200 NVL72"
+        const sysCounts = new Map();
+        let totGpus = 0;
+        let totModelInstances = 0;
+        for (const { plan, wsEntry, sys } of allResults) {
+            if (sys) {
+                sysCounts.set(sys.name, (sysCounts.get(sys.name) || 0) + plan.systemInstances);
+                totGpus += plan.systemInstances * sys.gpuCount;
+                totModelInstances += totalModelInstances(plan, wsEntry);
+            }
+        }
+        const sysMix = [...sysCounts.entries()]
+            .sort((a, b) => a[0].localeCompare(b[0]))
+            .map(([name, count]) => `${count}× ${name}`)
+            .join(', ') || 'none';
+
+        const writeGap = fmtRangeTp(rollupAvg.writeGapGiBps, rollupPeak.writeGapGiBps);
+        const readGap  = fmtRangeTp(rollupAvg.readGapGiBps,  rollupPeak.readGapGiBps);
+        const writeGapText = (rollupAvg.writeGapGiBps === 0 && rollupPeak.writeGapGiBps === 0)
+            ? '<span class="status-ok">none</span>'
+            : `<span class="status-err">${writeGap}</span>`;
+        const readGapText = (rollupAvg.readGapGiBps === 0 && rollupPeak.readGapGiBps === 0)
+            ? '<span class="status-ok">none</span>'
+            : `<span class="status-err">${readGap}</span>`;
+
+        return `
+            <h2 style="margin-top: 0;">Aggregate</h2>
+            <div class="plan-result-row"><span class="plan-result-label">Systems:</span><span class="plan-result-value">${sysMix}</span></div>
+            <div class="plan-result-row"><span class="plan-result-label">Total GPUs:</span><span class="plan-result-value">${totGpus}</span></div>
+            <div class="plan-result-row"><span class="plan-result-label">Total model instances:</span><span class="plan-result-value">${totModelInstances}</span></div>
+            <div class="plan-result-row"><span class="plan-result-label">Total KV Cache Size:</span><span class="plan-result-value">${fmtRangeSize(rollupAvg.totalKVSizeBytes, rollupPeak.totalKVSizeBytes)}</span></div>
+            <div class="plan-throughput-block">
+                <div class="plan-throughput-title">Write</div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">Demand:</span><span>${fmtRangeTp(rollupAvg.totalWriteGiBps, rollupPeak.totalWriteGiBps)}</span></div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">System cap:</span><span>${formatThroughputHuman(rollupAvg.writeBandwidthGiBps)}</span></div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">Achievable:</span><span>${fmtRangeTp(rollupAvg.writeAchievableGiBps, rollupPeak.writeAchievableGiBps)}</span></div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">Capacity gap:</span>${writeGapText}</div>
+            </div>
+            <div class="plan-throughput-block">
+                <div class="plan-throughput-title">Read</div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">Demand:</span><span>${fmtRangeTp(rollupAvg.totalReadGiBps, rollupPeak.totalReadGiBps)}</span></div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">System cap:</span><span>${formatThroughputHuman(rollupAvg.readBandwidthGiBps)}</span></div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">Achievable:</span><span>${fmtRangeTp(rollupAvg.readAchievableGiBps, rollupPeak.readAchievableGiBps)}</span></div>
+                <div class="plan-throughput-row"><span class="plan-throughput-label">Capacity gap:</span>${readGapText}</div>
+            </div>
+        `;
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-model detail HTML
+    // -----------------------------------------------------------------------
+    function buildDetailHTML(resultAvg, resultPeak, plan, wsEntry, horizonSeconds) {
         const lines = [];
+        const sys = resultAvg.systemRef;
 
         lines.push('<h3 style="margin-top: 10px;">Calculation Details</h3>');
 
-        // KV Cache Size derivation — one substituted line per bound
-        const totalExchLow  = plan.totalUsersLow  * plan.exchangesPerUserLow;
-        const totalExchHigh = plan.totalUsersHigh * plan.exchangesPerUserHigh;
+        const horizonDays = planData.planningHorizonDays;
         const kvPreamble =
-            `total_exchanges_low  = ${plan.totalUsersLow.toLocaleString()} × ${plan.exchangesPerUserLow.toLocaleString()} = ${totalExchLow.toLocaleString()} stored exchanges\n` +
-            `total_exchanges_high = ${plan.totalUsersHigh.toLocaleString()} × ${plan.exchangesPerUserHigh.toLocaleString()} = ${totalExchHigh.toLocaleString()} stored exchanges`;
+            `horizon_seconds = ${horizonDays} × 86400 = ${horizonSeconds.toLocaleString()} seconds\n` +
+            `rps_avg  = ${plan.rpsAverage}  requests/sec\n` +
+            `rps_peak = ${plan.rpsPeak}  requests/sec`;
 
         lines.push('<div class="plan-detail-section">');
         lines.push('<strong>KV Cache Size</strong>');
         lines.push(`<div class="plan-detail-formula">${kvPreamble}</div>`);
-
         lines.push('<div class="plan-detail-table-wrap">');
-        lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Exchanges</th><th>KV/seq</th><th>Subtotal</th></tr></thead><tbody>');
-        for (let i = 0; i < resultLow.bucketDetails.length; i++) {
-            const bL = resultLow.bucketDetails[i];
-            const bH = resultHigh.bucketDetails[i];
+        lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Hit %</th><th>Writes/sec</th><th>KV/seq</th><th>Subtotal</th></tr></thead><tbody>');
+        for (let i = 0; i < resultAvg.bucketDetails.length; i++) {
+            const bA = resultAvg.bucketDetails[i];
+            const bP = resultPeak.bucketDetails[i];
             lines.push(
-                `<tr><td>${bL.contextSize.toLocaleString()}</td>` +
-                `<td>${bL.percentage}%</td>` +
-                `<td>${formatRangeCount(bL.exchanges, bH.exchanges)}</td>` +
-                `<td>${formatSizeHuman(bL.kvBytesPerSeq)}</td>` +
-                `<td>${formatRangeSize(bL.sizeBytes, bH.sizeBytes)}</td></tr>`
+                `<tr><td>${bA.contextSize.toLocaleString()}</td>` +
+                `<td>${bA.percentage}%</td>` +
+                `<td>${bA.cacheHitRate}%</td>` +
+                `<td>${fmtRangeFloat(bA.writesPerSec, bP.writesPerSec)}</td>` +
+                `<td>${formatSizeHuman(bA.kvBytesPerSeq)}</td>` +
+                `<td>${fmtRangeSize(bA.sizeBytes, bP.sizeBytes)}</td></tr>`
             );
         }
-        lines.push(`</tbody><tfoot><tr><td colspan="4" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatRangeSize(resultLow.totalKVSizeBytes, resultHigh.totalKVSizeBytes)}</td></tr></tfoot></table>`);
+        lines.push(`</tbody><tfoot><tr><td colspan="5" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${fmtRangeSize(resultAvg.totalKVSizeBytes, resultPeak.totalKVSizeBytes)}</td></tr></tfoot></table>`);
         lines.push('</div>');
         lines.push('</div>');
 
-        // Throughput derivation — one substituted line per bound
-        const rateLowPerSec  = plan.serverInstances * plan.concurrentUsersLow  * plan.exchangeRatePerHourLow  / 3600;
-        const rateHighPerSec = plan.serverInstances * plan.concurrentUsersHigh * plan.exchangeRatePerHourHigh / 3600;
+        // Throughput preamble names rps + system bandwidth caps
+        const writeBw = sys ? `${plan.systemInstances} × ${sys.writeBandwidthGiBps} = ${(plan.systemInstances * sys.writeBandwidthGiBps).toFixed(2)} GiB/s` : 'no system';
+        const readBw  = sys ? `${plan.systemInstances} × ${sys.readBandwidthGiBps}  = ${(plan.systemInstances * sys.readBandwidthGiBps).toFixed(2)} GiB/s`  : 'no system';
         const tpPreamble =
-            `aggregate_exchanges_per_sec_low  = ${plan.serverInstances} × ${plan.concurrentUsersLow} × ${plan.exchangeRatePerHourLow} ÷ 3600 = ${rateLowPerSec.toFixed(3)} exchanges/sec\n` +
-            `aggregate_exchanges_per_sec_high = ${plan.serverInstances} × ${plan.concurrentUsersHigh} × ${plan.exchangeRatePerHourHigh} ÷ 3600 = ${rateHighPerSec.toFixed(3)} exchanges/sec`;
+            `rps_avg  = ${plan.rpsAverage}  requests/sec\n` +
+            `rps_peak = ${plan.rpsPeak}  requests/sec\n` +
+            `system_write_bw = systemInstances × system.writeBandwidth = ${writeBw}\n` +
+            `system_read_bw  = systemInstances × system.readBandwidth  = ${readBw}`;
+
+        const writeCapNote = (resultAvg.writeCapped || resultPeak.writeCapped) ? ' <span class="status-err">⚠ capped</span>' : '';
+        const readCapNote  = (resultAvg.readCapped  || resultPeak.readCapped)  ? ' <span class="status-err">⚠ capped</span>' : '';
 
         lines.push('<div class="plan-detail-section">');
         lines.push('<strong>Throughput</strong>');
         lines.push(`<div class="plan-detail-formula">${tpPreamble}</div>`);
-
         lines.push('<div class="plan-detail-table-wrap">');
-        lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Exch/sec</th><th>Hit Rate</th><th>Hits/sec</th><th>Misses/sec</th><th>Write</th><th>Read</th></tr></thead><tbody>');
-        for (let i = 0; i < resultLow.bucketDetails.length; i++) {
-            const bL = resultLow.bucketDetails[i];
-            const bH = resultHigh.bucketDetails[i];
-            const hitFrac = bL.cacheHitRate / 100;
-            const hitsLowPerSec    = bL.exchangesPerSec * hitFrac;
-            const hitsHighPerSec   = bH.exchangesPerSec * hitFrac;
-            const missesLowPerSec  = bL.exchangesPerSec * (1 - hitFrac);
-            const missesHighPerSec = bH.exchangesPerSec * (1 - hitFrac);
+        lines.push('<table class="plan-detail-table"><thead><tr><th>Context Size</th><th>%</th><th>Req/sec</th><th>Hit %</th><th>Hits/sec</th><th>Misses/sec</th><th>Write demand</th><th>Read demand</th></tr></thead><tbody>');
+        for (let i = 0; i < resultAvg.bucketDetails.length; i++) {
+            const bA = resultAvg.bucketDetails[i];
+            const bP = resultPeak.bucketDetails[i];
             lines.push(
-                `<tr><td>${bL.contextSize.toLocaleString()}</td>` +
-                `<td>${bL.percentage}%</td>` +
-                `<td>${formatRangeFloat(bL.exchangesPerSec, bH.exchangesPerSec)}</td>` +
-                `<td>${bL.cacheHitRate}%</td>` +
-                `<td>${formatRangeFloat(hitsLowPerSec, hitsHighPerSec)}</td>` +
-                `<td>${formatRangeFloat(missesLowPerSec, missesHighPerSec)}</td>` +
-                `<td>${formatRangeThroughput(bL.writeBytesPerSec / (1024 ** 3), bH.writeBytesPerSec / (1024 ** 3))}</td>` +
-                `<td>${formatRangeThroughput(bL.readBytesPerSec  / (1024 ** 3), bH.readBytesPerSec  / (1024 ** 3))}</td></tr>`
+                `<tr><td>${bA.contextSize.toLocaleString()}</td>` +
+                `<td>${bA.percentage}%</td>` +
+                `<td>${fmtRangeFloat(bA.requestsPerSec, bP.requestsPerSec)}</td>` +
+                `<td>${bA.cacheHitRate}%</td>` +
+                `<td>${fmtRangeFloat(bA.readsPerSec,  bP.readsPerSec)}</td>` +
+                `<td>${fmtRangeFloat(bA.writesPerSec, bP.writesPerSec)}</td>` +
+                `<td>${fmtRangeTp(bA.writeBytesPerSec / (1024 ** 3), bP.writeBytesPerSec / (1024 ** 3))}</td>` +
+                `<td>${fmtRangeTp(bA.readBytesPerSec  / (1024 ** 3), bP.readBytesPerSec  / (1024 ** 3))}</td></tr>`
             );
         }
-        lines.push(`</tbody><tfoot><tr><td colspan="6" style="text-align: right; font-weight: 600;">Total:</td><td style="font-weight: 600;">${formatRangeThroughput(resultLow.totalWriteGiBps, resultHigh.totalWriteGiBps)}</td><td style="font-weight: 600;">${formatRangeThroughput(resultLow.totalReadGiBps, resultHigh.totalReadGiBps)}</td></tr></tfoot></table>`);
+        lines.push(`</tbody><tfoot>` +
+            `<tr><td colspan="6" style="text-align: right; font-weight: 600;">Demand totals:</td>` +
+            `<td style="font-weight: 600;">${fmtRangeTp(resultAvg.totalWriteGiBps, resultPeak.totalWriteGiBps)}${writeCapNote}</td>` +
+            `<td style="font-weight: 600;">${fmtRangeTp(resultAvg.totalReadGiBps, resultPeak.totalReadGiBps)}${readCapNote}</td></tr>` +
+            `<tr><td colspan="6" style="text-align: right; font-weight: 600;">Achievable totals:</td>` +
+            `<td style="font-weight: 600;">${fmtRangeTp(resultAvg.writeAchievableGiBps, resultPeak.writeAchievableGiBps)}</td>` +
+            `<td style="font-weight: 600;">${fmtRangeTp(resultAvg.readAchievableGiBps, resultPeak.readAchievableGiBps)}</td></tr>` +
+            `</tfoot></table>`);
         lines.push('</div>');
         lines.push('</div>');
 
@@ -839,39 +981,47 @@ function renderPlanPage(container) {
     }
 
     // -----------------------------------------------------------------------
-    // Rollup detail: per-model contribution summary
+    // Roll-up detail
     // -----------------------------------------------------------------------
     function buildRollupDetailHTML(allResults) {
         const lines = [];
         lines.push('<h3 style="margin-top: 10px;">Per-Model Breakdown</h3>');
-        lines.push('<table class="plan-detail-table"><thead><tr><th>Model</th><th>GPUs</th><th>KV Cache Size</th><th>Write</th><th>Read</th></tr></thead><tbody>');
-        for (const { resultLow, resultHigh, wsEntry, gpus, tp } of allResults) {
-            const gpuCell = tp > 1 ? `${gpus} (TP=${tp})` : `${gpus}`;
+        lines.push('<table class="plan-detail-table"><thead><tr>' +
+            '<th>Model</th><th>Systems</th><th>GPUs</th>' +
+            '<th>KV Cache</th>' +
+            '<th>Write demand</th><th>Write achievable</th>' +
+            '<th>Read demand</th><th>Read achievable</th>' +
+            '</tr></thead><tbody>');
+        for (const { resultAvg, resultPeak, wsEntry, plan, sys } of allResults) {
+            const sysCell = sys ? `${plan.systemInstances}× ${sys.name}` : 'no system';
+            const gpus = sys ? plan.systemInstances * sys.gpuCount : 0;
+            const writeNote = (resultAvg.writeCapped || resultPeak.writeCapped) ? ' <span class="status-err">⚠</span>' : '';
+            const readNote  = (resultAvg.readCapped  || resultPeak.readCapped)  ? ' <span class="status-err">⚠</span>' : '';
             lines.push(
-                `<tr><td>${wsEntry.title}</td>` +
-                `<td>${gpuCell}</td>` +
-                `<td>${formatRangeSize(resultLow.totalKVSizeBytes, resultHigh.totalKVSizeBytes)}</td>` +
-                `<td>${formatRangeThroughput(resultLow.totalWriteGiBps, resultHigh.totalWriteGiBps)}</td>` +
-                `<td>${formatRangeThroughput(resultLow.totalReadGiBps, resultHigh.totalReadGiBps)}</td></tr>`
+                `<tr>` +
+                `<td>${planCardTitle(wsEntry)}</td>` +
+                `<td>${sysCell}</td>` +
+                `<td>${gpus}</td>` +
+                `<td>${fmtRangeSize(resultAvg.totalKVSizeBytes, resultPeak.totalKVSizeBytes)}</td>` +
+                `<td>${fmtRangeTp(resultAvg.totalWriteGiBps, resultPeak.totalWriteGiBps)}${writeNote}</td>` +
+                `<td>${fmtRangeTp(resultAvg.writeAchievableGiBps, resultPeak.writeAchievableGiBps)}</td>` +
+                `<td>${fmtRangeTp(resultAvg.totalReadGiBps, resultPeak.totalReadGiBps)}${readNote}</td>` +
+                `<td>${fmtRangeTp(resultAvg.readAchievableGiBps, resultPeak.readAchievableGiBps)}</td>` +
+                `</tr>`
             );
         }
         lines.push('</tbody></table>');
         return lines.join('');
     }
 
-    // -----------------------------------------------------------------------
-    // Debounced recalculation — only updates outputs, never rebuilds inputs
-    // -----------------------------------------------------------------------
     function scheduleRecalc() {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(updateOutputs, 200);
     }
 
-    // Initial load and render
     loadData();
     render();
 
-    // Return cleanup function
     return () => {
         clearTimeout(debounceTimer);
     };

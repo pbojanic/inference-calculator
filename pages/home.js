@@ -9,6 +9,28 @@ const POPULAR_MODELS = [
     'Qwen/Qwen2.5-7B-Instruct'
 ];
 
+// If the user pastes a full HF model ID (`<owner>/<model>`) or an HF URL,
+// return the canonical `<owner>/<model>` so we can skip the search API and
+// fetch the config directly. Returns null when the input is a search term
+// (anything that doesn't look like a complete identifier).
+//
+// HF allows letters, numbers, underscores, dots, and hyphens in both the
+// owner and model segments. We accept either a bare id, or a URL on
+// huggingface.co / hf.co (with or without protocol, with or without an
+// extra path like /tree/main or /blob/main/config.json).
+function extractHfModelId(input) {
+    const trimmed = (input || '').trim();
+    if (!trimmed) return null;
+
+    const urlRe = /^(?:https?:\/\/)?(?:www\.)?(?:huggingface\.co|hf\.co)\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)/i;
+    const m = trimmed.match(urlRe);
+    if (m) return `${m[1]}/${m[2]}`;
+
+    if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(trimmed)) return trimmed;
+
+    return null;
+}
+
 function renderHomePage(container) {
     let selectedId = null;
     let searchTimeout = null;
@@ -68,14 +90,22 @@ function renderHomePage(container) {
             const weightGB = (params.total_params * (deployment.bytesPerWeight || 2)) / (1024 ** 3);
             const ctxLen = deployment.contextOverride || config.max_position_embeddings || 131072;
             const kv = calculateKVCacheMemory(config, 1, ctxLen, deployment.tp || 1, deployment.bytesPerKV || 2);
-            const gpu = getGpu(deployment.gpuId);
-            const gpuName = gpu ? gpu.name : 'No GPU';
+            const sys = getSystem(deployment.systemId);
+            const sysName = sys ? sys.name : 'No system';
 
             const swCap = config.sliding_window ? ` (sw: ${(config.sliding_window / 1024).toFixed(0)}K)` : '';
+            const moeNote = params.is_moe
+                ? ` <span style="color: var(--text-muted); font-size: 0.85em;">(MoE ${params.num_routed_experts}\u00d7${params.moe_intermediate_size}, top-${params.num_experts_per_tok || '?'})</span>`
+                : '';
+            const totalB = (params.total_params / 1e9).toFixed(1);
+            const paramsLabel = params.is_moe
+                ? `${(params.active_params / 1e9).toFixed(1)}B act / ${totalB}B`
+                : `${totalB}B`;
 
             stats.innerHTML = `
-                <span>${gpuName}</span>
-                <span>Weights: ${weightGB.toFixed(1)} GiB</span>
+                <span>${sysName}</span>
+                <span>Params: ${paramsLabel}</span>
+                <span>Weights: ${weightGB.toFixed(1)} GiB${moeNote}</span>
                 <span>KV Cache: ${kv.total_kv_cache_gb.toFixed(1)} GiB</span>
                 <span>Context: ${(ctxLen / 1024).toFixed(0)}K${swCap}</span>
             `;
@@ -109,6 +139,7 @@ function renderHomePage(container) {
         if (config) {
             const params = calculateModelParameters(config);
             const weightGB = (params.total_params * (deployment.bytesPerWeight || 2)) / (1024 ** 3);
+            const activeGB = (params.active_params * (deployment.bytesPerWeight || 2)) / (1024 ** 3);
             const kv = calculateKVCacheMemory(config, 1, ctxLen, deployment.tp || 1, deployment.bytesPerKV || 2);
 
             const defaultCtx = (config.max_position_embeddings) || 131072;
@@ -123,16 +154,28 @@ function renderHomePage(container) {
                 ? ` (effective KV: ${(kv.effective_kv_length / 1024).toFixed(0)}K)`
                 : '';
 
-            const gpu = getGpu(deployment.gpuId);
-            const gpuDisplay = gpu ? `${gpu.name} (${gpu.memoryGB} GB)` : 'No GPU assigned';
+            const sys = getSystem(deployment.systemId);
+            const sysDisplay = sys
+                ? `${sys.name} — ${sys.gpuCount}× ${sys.gpuType} @ ${sys.gpuMemoryGB} GB/GPU`
+                : 'No system assigned';
+            const ppVal = deployment.pp || 1;
+            const tpPpLabel = ppVal > 1
+                ? `TP=${deployment.tp}, PP=${ppVal} (${deployment.tp * ppVal} GPUs/instance)`
+                : `TP=${deployment.tp}`;
+
+            const moeRow = params.is_moe
+                ? `<div class="model-detail-row"><span class="label">Architecture:</span> MoE — ${params.num_routed_experts} routed experts (top-${params.num_experts_per_tok || '?'} per token)${params.num_shared_experts > 0 ? `, ${params.num_shared_experts} shared` : ''}${params.num_mtp_modules > 0 ? `, ${params.num_mtp_modules} MTP` : ''}</div>
+                <div class="model-detail-row"><span class="label">Active params:</span> ${(params.active_params / 1e9).toFixed(2)}B / ${(params.total_params / 1e9).toFixed(2)}B total (${activeGB.toFixed(2)} GiB active)</div>`
+                : `<div class="model-detail-row"><span class="label">Parameters:</span> ${(params.total_params / 1e9).toFixed(2)}B</div>`;
 
             panel.innerHTML = `
-                <div class="model-detail-row"><span class="label">GPU:</span> ${gpuDisplay}</div>
+                <div class="model-detail-row"><span class="label">System:</span> ${sysDisplay}</div>
                 <div class="model-detail-row"><span class="label">Max context:</span> ${(ctxLen / 1024).toFixed(0)}K tokens${ctxNote}</div>
                 ${swNote}
+                ${moeRow}
                 <div class="model-detail-row"><span class="label">Weight memory:</span> ${weightGB.toFixed(2)} GiB</div>
                 <div class="model-detail-row"><span class="label">KV Cache (agg):</span> ${kv.total_kv_cache_gb.toFixed(2)} GiB${kvNote}</div>
-                <div class="model-detail-row"><span class="label">Tensor parallel:</span> ${deployment.tp}</div>
+                <div class="model-detail-row"><span class="label">Parallelism:</span> ${tpPpLabel}</div>
                 <div class="model-detail-row"><span class="label">Precision:</span> ${deployment.bytesPerWeight} bytes/weight (${deployment.precisionMode})</div>
             `;
         }
@@ -204,7 +247,7 @@ function renderHomePage(container) {
 
         const searchInput = document.createElement('input');
         searchInput.type = 'text';
-        searchInput.placeholder = 'e.g. Qwen/ or meta-llama/Llama-3';
+        searchInput.placeholder = 'Search by name, or paste a full HF id / URL';
         searchInput.id = 'hf-search-input';
 
         const searchBtn = document.createElement('button');
@@ -224,9 +267,37 @@ function renderHomePage(container) {
         statusDiv.style.cssText = 'font-size: 0.75rem; margin-top: 4px; min-height: 1.2em;';
         searchContainer.appendChild(statusDiv);
 
-        async function doSearch() {
+        async function doSearch(opts) {
+            const explicit = !!(opts && opts.explicit);
             const query = searchInput.value.trim();
             if (!query) return;
+
+            // Cancel any pending debounced search so it can't overwrite our
+            // status mid-fetch (race: explicit Enter fires before a 500ms
+            // typing-debounce timer that was queued by the paste).
+            if (explicit) clearTimeout(searchTimeout);
+
+            // Fast-path: when the user pastes a full HF model ID or URL on an
+            // explicit submit (Enter or Search button), skip the search API
+            // and fetch the config directly. Saves a click for the very case
+            // where search-by-popularity buries fresh releases (a brand-new
+            // model with low downloads won't make our `limit=20` page).
+            //
+            // Gated on `explicit` so the debounced typing path doesn't fire
+            // a fetch mid-keystroke when the input briefly looks like a
+            // complete id (e.g. user pauses after typing "mistralai/Mistral").
+            // The paste event handler also routes through here with
+            // explicit:true so a pasted URL fires immediately.
+            if (explicit) {
+                const directId = extractHfModelId(query);
+                if (directId) {
+                    statusDiv.textContent = `Fetching ${directId}...`;
+                    statusDiv.className = 'status-loading';
+                    resultsDiv.style.display = 'none';
+                    await addModelByName(directId);
+                    return;
+                }
+            }
 
             statusDiv.textContent = 'Searching...';
             statusDiv.className = 'status-loading';
@@ -267,14 +338,35 @@ function renderHomePage(container) {
             }
         }
 
-        searchBtn.onclick = doSearch;
+        searchBtn.onclick = () => doSearch({ explicit: true });
         searchInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') { e.preventDefault(); doSearch(); }
+            if (e.key === 'Enter') { e.preventDefault(); doSearch({ explicit: true }); }
+        });
+
+        // Paste a full HF id or URL → fire the fast-path right away rather
+        // than waiting 500ms for the debounced search (which would hit the
+        // search API and report "No models found" for a brand-new release
+        // not yet in the top-20-by-downloads). We read the pasted text from
+        // clipboardData because the input.value isn't updated yet at this
+        // point in the event sequence.
+        searchInput.addEventListener('paste', (e) => {
+            const cb = e.clipboardData || window.clipboardData;
+            if (!cb) return;
+            const pasted = cb.getData('text');
+            const directId = extractHfModelId(pasted);
+            if (!directId) return;
+            e.preventDefault();
+            searchInput.value = directId;
+            clearTimeout(searchTimeout);
+            doSearch({ explicit: true });
         });
 
         searchInput.addEventListener('input', () => {
             clearTimeout(searchTimeout);
             searchTimeout = setTimeout(() => {
+                // Debounced typing: never trigger the explicit fast-path so a
+                // mid-keystroke pause on "mistralai/Mistral" doesn't fire a
+                // fetch the user didn't intend.
                 if (searchInput.value.trim().length >= 3) doSearch();
             }, 500);
         });
@@ -290,7 +382,10 @@ function renderHomePage(container) {
     }
 
     // -----------------------------------------------------------------------
-    // Add a model by name (fetch from HF if needed, then add to workspace)
+    // Add a model by name. Fetches from HF if not cached, then stages a
+    // PENDING entry on State.pendingNewModel and routes to Model Details.
+    // The model is NOT persisted to the workspace until the user presses
+    // Save on the Details page (and clears mandatory-field validation).
     // -----------------------------------------------------------------------
     async function addModelByName(hfName) {
         const statusDiv = container.querySelector('.search-container div:last-child') ||
@@ -304,7 +399,9 @@ function renderHomePage(container) {
             try {
                 const token = getHFToken();
                 config = await fetchModelFromHF(hfName, token);
-                // Cache in model store for future adds
+                // Cache the architecture config for future adds. This is
+                // the cached model store, not the workspace — caching the
+                // raw HF config is fine even if the user cancels.
                 saveModelConfig(hfName, config);
             } catch (e) {
                 statusDiv.textContent = e.message;
@@ -313,19 +410,17 @@ function renderHomePage(container) {
             }
         }
 
-        // Use the HF name as the default title
+        // Default title is the HF name; auto-suffix if it collides with an
+        // existing workspace entry so the user lands on a saveable default.
         let title = hfName;
-
-        // If this exact title already exists, append a number
         if (isWorkspaceTitleTaken(title)) {
             let n = 2;
             while (isWorkspaceTitleTaken(`${hfName} (${n})`)) n++;
             title = `${hfName} (${n})`;
         }
 
-        const newId = addToWorkspace(hfName, config, title);
-        selectedId = newId;
-        render();
+        State.pendingNewModel = { baseModel: hfName, config, title };
+        Router.navigate('#model/_new');
     }
 
     render();

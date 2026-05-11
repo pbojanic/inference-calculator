@@ -9,10 +9,33 @@ function renderModelDetailPage(container, params) {
         return null;
     }
 
-    const entry = getWorkspaceEntry(entryId);
-    if (!entry) {
-        container.innerHTML = `<p>Model not found. <a href="#home">Go home</a></p>`;
-        return null;
+    // `_new` is a synthetic id for an unsaved draft staged by the Home page
+    // on State.pendingNewModel. The model is not yet in the workspace; it
+    // gets persisted (via addToWorkspace) only when Save passes validation.
+    const isDraft = entryId === '_new';
+    let entry;
+    if (isDraft) {
+        const pending = State.pendingNewModel;
+        if (!pending) {
+            // The draft was lost (page refresh, or arrived here directly).
+            // Send the user back home rather than fabricating a blank entry.
+            container.innerHTML = '<p>No pending model. <a href="#home">Go home</a></p>';
+            setTimeout(() => Router.navigate('#home'), 0);
+            return null;
+        }
+        entry = {
+            id: '_new',
+            title: pending.title,
+            baseModel: pending.baseModel,
+            config: pending.config,
+            deployment: defaultDeployment(pending.config)
+        };
+    } else {
+        entry = getWorkspaceEntry(entryId);
+        if (!entry) {
+            container.innerHTML = `<p>Model not found. <a href="#home">Go home</a></p>`;
+            return null;
+        }
     }
 
     const config = entry.config;
@@ -29,6 +52,12 @@ function renderModelDetailPage(container, params) {
     let currentTitle = entry.title;
     let calcTimeout = null;
 
+    // A draft entry is unsaved by definition — flip the dirty flag so the
+    // unsaved-changes guard fires if the user navigates away without saving.
+    if (isDraft) {
+        State.setDirty(true);
+    }
+
     function render() {
         container.innerHTML = '';
 
@@ -41,6 +70,8 @@ function renderModelDetailPage(container, params) {
             Router.navigate('#home');
         };
         container.appendChild(backLink);
+        // Note: `params` here is a plain object provided by our hash router
+        // (router.js _parseHash). This is NOT a Next.js page.
 
         const titleRow = document.createElement('div');
         titleRow.style.cssText = 'display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px;';
@@ -53,6 +84,20 @@ function renderModelDetailPage(container, params) {
             baseSpan.style.cssText = 'font-size: 0.8rem; color: var(--text-muted);';
             baseSpan.textContent = entry.baseModel;
             titleRow.appendChild(baseSpan);
+        }
+        if (config && config._compatibilityMode === 'mistral-params') {
+            const badge = document.createElement('span');
+            badge.className = 'compat-badge';
+            badge.textContent = 'params.json compatibility';
+            badge.title = 'Loaded from Mistral-native params.json — no HF transformers config.json was published. Estimates may differ from a future HF-format release.';
+            titleRow.appendChild(badge);
+        }
+        if (config && config._multimodal) {
+            const badge = document.createElement('span');
+            badge.className = 'compat-badge';
+            badge.textContent = 'LLM only';
+            badge.title = 'Multimodal model — only the language-model portion is modelled. Vision encoder weights, KV cache, and activations are excluded from the totals.';
+            titleRow.appendChild(badge);
         }
         container.appendChild(titleRow);
 
@@ -72,7 +117,7 @@ function renderModelDetailPage(container, params) {
         inputPanel.className = 'panel';
         inputPanel.appendChild(buildTitleSection());
         inputPanel.appendChild(buildModelSelectorSection());
-        inputPanel.appendChild(buildGPUSection());
+        inputPanel.appendChild(buildSystemSection());
         inputPanel.appendChild(buildDeploymentSection());
         inputPanel.appendChild(buildStorageSection());
         inputPanel.appendChild(buildPrecisionSection());
@@ -85,7 +130,31 @@ function renderModelDetailPage(container, params) {
 
         const reportPanel = document.createElement('div');
         reportPanel.className = 'panel';
-        reportPanel.innerHTML = '<h2>Memory Breakdown</h2>';
+        const reportHeader = document.createElement('div');
+        reportHeader.className = 'section-header';
+        const reportTitle = document.createElement('h2');
+        reportTitle.textContent = 'Memory Breakdown';
+        const headerCopyBtn = document.createElement('button');
+        headerCopyBtn.type = 'button';
+        headerCopyBtn.className = 'icon-btn';
+        headerCopyBtn.title = 'Copy report to clipboard';
+        headerCopyBtn.setAttribute('aria-label', 'Copy report to clipboard');
+        const COPY_ICON_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+        const CHECK_ICON_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+        headerCopyBtn.innerHTML = COPY_ICON_SVG;
+        headerCopyBtn.onclick = async () => {
+            const ok = await copyReport();
+            if (!ok) return;
+            headerCopyBtn.innerHTML = CHECK_ICON_SVG;
+            headerCopyBtn.classList.add('icon-btn--ok');
+            setTimeout(() => {
+                headerCopyBtn.innerHTML = COPY_ICON_SVG;
+                headerCopyBtn.classList.remove('icon-btn--ok');
+            }, 1500);
+        };
+        reportHeader.appendChild(reportTitle);
+        reportHeader.appendChild(headerCopyBtn);
+        reportPanel.appendChild(reportHeader);
         const reportDiv = document.createElement('div');
         reportDiv.id = 'detail-report';
         reportDiv.className = 'report-output';
@@ -156,7 +225,8 @@ function renderModelDetailPage(container, params) {
         currentDeployment.maxSeqs = parseInt(el('detail-maxSeqs').value) || 1;
         currentDeployment.batchTokens = parseInt(el('detail-batchTokens').value) || 8192;
         currentDeployment.tp = parseInt(el('detail-tp').value) || 1;
-        currentDeployment.gpuId = el('detail-gpu').value;
+        currentDeployment.pp = parseInt(el('detail-pp').value) || 1;
+        currentDeployment.systemId = el('detail-system').value || null;
         currentDeployment.gpuUtil = parseFloat(el('detail-gpuUtil').value) || 0.85;
         currentDeployment.cufileBuf = parseFloat(el('detail-cufileBuf').value) || 0;
         currentDeployment.bytesPerWeight = parseFloat(el('detail-bpw').value) || 2;
@@ -272,6 +342,15 @@ function renderModelDetailPage(container, params) {
                 </label>
                 <label>Tensor parallel
                     <input type="number" id="detail-tp" value="${currentDeployment.tp}" min="1">
+                    <span style="font-size: 0.7rem; color: var(--text-muted);">Splits within one system (NVLink). Must be \u2264 system GPU count.</span>
+                    <div id="detail-tp-error" class="status-err" style="min-height: 1em; font-size: 0.75rem;"></div>
+                </label>
+            </div>
+            <div class="row">
+                <label>Pipeline parallel
+                    <input type="number" id="detail-pp" value="${currentDeployment.pp || 1}" min="1">
+                    <span style="font-size: 0.7rem; color: var(--text-muted);">Stages across systems (or within a large system). GPUs per instance = TP \u00d7 PP.</span>
+                    <div id="detail-pp-error" class="status-err" style="min-height: 1em; font-size: 0.75rem;"></div>
                 </label>
             </div>
         `;
@@ -279,40 +358,75 @@ function renderModelDetailPage(container, params) {
         return div;
     }
 
-    // -----------------------------------------------------------------------
-    // GPU configuration
-    // -----------------------------------------------------------------------
-    function buildGPUSection() {
-        const div = document.createElement('div');
-        const gpus = getGpuList();
+    function validateTpAgainstSystem() {
+        const errEl = document.getElementById('detail-tp-error');
+        const sys = getSystem(currentDeployment.systemId);
+        if (!errEl) return true;
+        if (!sys) { errEl.textContent = ''; return true; }
+        if (currentDeployment.tp > sys.gpuCount) {
+            errEl.textContent = `TP=${currentDeployment.tp} exceeds ${sys.name}'s ${sys.gpuCount} GPUs.`;
+            return false;
+        }
+        errEl.textContent = '';
+        return true;
+    }
 
-        let options = gpus.map(g =>
-            `<option value="${g.id}" ${g.id === currentDeployment.gpuId ? 'selected' : ''}>${g.name} (${g.memoryGB} GB)</option>`
+    // -----------------------------------------------------------------------
+    // System configuration
+    // -----------------------------------------------------------------------
+    function buildSystemSection() {
+        const div = document.createElement('div');
+        const systems = getSystemList();
+
+        const noSystemSelected = !currentDeployment.systemId;
+        const placeholder = noSystemSelected
+            ? '<option value="" disabled selected>Select a system…</option>'
+            : '';
+        const options = placeholder + systems.map(s =>
+            `<option value="${s.id}" ${s.id === currentDeployment.systemId ? 'selected' : ''}>${s.name} — ${s.gpuCount}× ${s.gpuType} @ ${s.gpuMemoryGB} GB</option>`
         ).join('');
 
         div.innerHTML = `
-            <h2>GPU</h2>
-            <label>GPU profile
-                <select id="detail-gpu">${options}</select>
+            <h2>System</h2>
+            <label>System
+                <select id="detail-system">${options}</select>
             </label>
+            <div id="detail-system-info" class="model-detail-row" style="font-size: 0.75rem; color: var(--text-muted);"></div>
             <label>Memory utilization: <span id="detail-utilLabel">${Math.round(currentDeployment.gpuUtil * 100)}%</span>
                 <input type="range" id="detail-gpuUtil" min="0.10" max="0.99" step="0.01" value="${currentDeployment.gpuUtil}">
             </label>
         `;
 
         setTimeout(() => {
-            const sel = document.getElementById('detail-gpu');
+            const sel = document.getElementById('detail-system');
             const slider = document.getElementById('detail-gpuUtil');
-            if (sel) sel.addEventListener('change', onInputChange);
+            if (sel) sel.addEventListener('change', () => {
+                onInputChange();
+                renderSystemInfo();
+            });
             if (slider) {
                 slider.addEventListener('input', () => {
                     document.getElementById('detail-utilLabel').textContent = Math.round(slider.value * 100) + '%';
                     onInputChange();
                 });
             }
+            renderSystemInfo();
         }, 0);
 
         return div;
+    }
+
+    function renderSystemInfo() {
+        const infoEl = document.getElementById('detail-system-info');
+        if (!infoEl) return;
+        const sys = getSystem(currentDeployment.systemId);
+        if (!sys) {
+            infoEl.innerHTML = '<span class="status-err">Pick a system to continue. Add or edit systems on the <a href="#systems" style="color: var(--accent);">Systems page</a>.</span>';
+            return;
+        }
+        infoEl.innerHTML =
+            `Bandwidth: read ${sys.readBandwidthGiBps} GiB/s · write ${sys.writeBandwidthGiBps} GiB/s · ` +
+            `TP must be ≤ ${sys.gpuCount}.`;
     }
 
     // -----------------------------------------------------------------------
@@ -390,24 +504,72 @@ function renderModelDetailPage(container, params) {
         const saveBtn = document.createElement('button');
         saveBtn.className = 'btn-primary';
         saveBtn.textContent = 'Save';
-        saveBtn.onclick = () => {
+        saveBtn.onclick = async () => {
             readFormValues();
 
-            // Validate title uniqueness
+            // Collect every validation issue up front so the user sees the
+            // whole list in one dialog rather than fixing one issue at a
+            // time and re-pressing Save. Identity-against-self uses the
+            // synthetic '_new' id for drafts so the title-uniqueness check
+            // doesn't accidentally collide with itself.
+            const issues = [];
+            const titleErrEl = document.getElementById('detail-title-error');
+            if (titleErrEl) titleErrEl.textContent = '';
+
             if (!currentTitle) {
-                const errEl = document.getElementById('detail-title-error');
-                if (errEl) errEl.textContent = 'Title cannot be empty.';
-                return;
+                issues.push('Title is required.');
+                if (titleErrEl) titleErrEl.textContent = 'Title cannot be empty.';
+            } else if (isWorkspaceTitleTaken(currentTitle, entryId)) {
+                issues.push(`A model with the title "${currentTitle}" already exists. Pick a different title.`);
+                if (titleErrEl) titleErrEl.textContent = 'A model with this title already exists.';
             }
-            if (isWorkspaceTitleTaken(currentTitle, entryId)) {
-                const errEl = document.getElementById('detail-title-error');
-                if (errEl) errEl.textContent = 'A model with this title already exists.';
+
+            const ppErrEl = document.getElementById('detail-pp-error');
+            if (ppErrEl) ppErrEl.textContent = '';
+            const ppVal = currentDeployment.pp || 1;
+            if (ppVal < 1) {
+                issues.push('Pipeline parallel must be at least 1.');
+                if (ppErrEl) ppErrEl.textContent = 'Must be \u2265 1.';
+            }
+
+            if (!currentDeployment.systemId) {
+                issues.push('No system selected. Pick a system in the System section. Add or edit systems on the Systems page.');
+                renderSystemInfo();
+            } else {
+                const sys = getSystem(currentDeployment.systemId);
+                // Each pipeline stage's TP ranks share NVLink within one
+                // system, so TP itself can never exceed system.gpuCount —
+                // even when PP > 1 spans systems.
+                if (sys && currentDeployment.tp > sys.gpuCount) {
+                    issues.push(`Tensor parallel (${currentDeployment.tp}) exceeds ${sys.name}'s ${sys.gpuCount} GPUs. Each pipeline stage must fit within one system's NVLink fabric.`);
+                    validateTpAgainstSystem();
+                }
+                // The combined `tp \u00d7 pp \u2264 totalGPUsAvailable` check is
+                // intentionally deferred to the Plan page where systemInstances
+                // is known. Here we only assert the per-stage NVLink constraint.
+            }
+
+            if (issues.length) {
+                await alertDialog('Cannot save \u2014 please fix:', issues);
                 return;
             }
 
-            entry.title = currentTitle;
-            entry.deployment = { ...currentDeployment };
-            saveWorkspaceEntry(entry);
+            // Validation passed. For a draft, addToWorkspace persists the
+            // entry for the first time and returns the new id.
+            if (isDraft) {
+                const newId = addToWorkspace(entry.baseModel, config, currentTitle);
+                const persisted = getWorkspaceEntry(newId);
+                if (persisted) {
+                    persisted.deployment = { ...currentDeployment };
+                    saveWorkspaceEntry(persisted);
+                }
+                State.pendingNewModel = null;
+            } else {
+                entry.title = currentTitle;
+                entry.deployment = { ...currentDeployment };
+                saveWorkspaceEntry(entry);
+            }
+
             savedDeployment = { ...currentDeployment };
             savedTitle = currentTitle;
             State.setDirty(false);
@@ -421,6 +583,9 @@ function renderModelDetailPage(container, params) {
             currentDeployment = { ...savedDeployment };
             currentTitle = savedTitle;
             State.setDirty(false);
+            // A draft has nothing on disk — discarding it just means
+            // dropping the in-memory pending slot and going home.
+            if (isDraft) State.pendingNewModel = null;
             location.hash = '#home';
         };
 
@@ -433,8 +598,19 @@ function renderModelDetailPage(container, params) {
     // Calculation & rendering
     // -----------------------------------------------------------------------
     function runCalculation() {
-        const gpu = getGpu(currentDeployment.gpuId);
-        const gpuMemoryGB = gpu ? gpu.memoryGB : 79.7;
+        validateTpAgainstSystem();
+        const sys = getSystem(currentDeployment.systemId);
+        if (!sys) {
+            const reportEl = document.getElementById('detail-report');
+            if (reportEl) reportEl.textContent = 'Select a system to see the memory analysis.';
+            const summaryEl = document.getElementById('detail-summary-stats');
+            if (summaryEl) summaryEl.innerHTML = '<span class="status-err">No system selected — pick one in the System section above.</span>';
+            if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
+            if (stackChartInstance) { stackChartInstance.destroy(); stackChartInstance = null; }
+            lastReport = '';
+            return;
+        }
+        const gpuMemoryGB = sys.gpuMemoryGB;
 
         const result = calculateCompleteAnalysis({
             config,
@@ -445,6 +621,7 @@ function renderModelDetailPage(container, params) {
             gpuMemoryGB,
             gpuMemoryUtil: currentDeployment.gpuUtil,
             tensorParallel: currentDeployment.tp,
+            pipelineParallel: currentDeployment.pp || 1,
             cufileBufferGB: currentDeployment.cufileBuf,
             bytesPerWeight: currentDeployment.bytesPerWeight,
             bytesPerKV: currentDeployment.bytesPerKV,
@@ -460,10 +637,19 @@ function renderModelDetailPage(container, params) {
         // Update summary stats
         const summaryEl = document.getElementById('detail-summary-stats');
         if (summaryEl) {
-            const gpuName = gpu ? gpu.name : 'No GPU';
+            const ppVal = currentDeployment.pp || 1;
+            const tpLabel = ppVal > 1
+                ? `TP=${currentDeployment.tp}, PP=${ppVal}`
+                : `TP=${currentDeployment.tp}`;
+            const sysLabel = sys ? `${sys.name} (${tpLabel})` : 'No system';
             const ctxK = (currentDeployment.seqLen / 1024).toFixed(0);
+            const totalB = (result.paramBreakdown.total_params / 1e9).toFixed(1);
+            const paramsLabel = result.paramBreakdown.is_moe
+                ? `${(result.paramBreakdown.active_params / 1e9).toFixed(1)}B act / ${totalB}B`
+                : `${totalB}B`;
             summaryEl.innerHTML = `
-                <span>${gpuName}</span>
+                <span>${sysLabel}</span>
+                <span>Params: ${paramsLabel}</span>
                 <span>Weights: ${result.totalWeightsGB.toFixed(1)} GiB</span>
                 <span>KV Cache: ${result.kv.total_kv_cache_gb.toFixed(1)} GiB</span>
                 <span>Context: ${ctxK}K</span>
@@ -713,9 +899,17 @@ function renderModelDetailPage(container, params) {
     // -----------------------------------------------------------------------
     // Export
     // -----------------------------------------------------------------------
-    function copyReport() {
-        if (!lastReport) return;
-        navigator.clipboard.writeText(lastReport);
+    async function copyReport() {
+        if (!lastReport) return false;
+        try {
+            await navigator.clipboard.writeText(lastReport);
+            return true;
+        } catch (e) {
+            if (typeof showToast === 'function') {
+                showToast('Could not copy to clipboard: ' + e.message, 'warn');
+            }
+            return false;
+        }
     }
 
     function downloadReport() {
@@ -736,6 +930,10 @@ function renderModelDetailPage(container, params) {
         clearTimeout(calcTimeout);
         if (barChartInstance) { barChartInstance.destroy(); barChartInstance = null; }
         if (stackChartInstance) { stackChartInstance.destroy(); stackChartInstance = null; }
+        // Whenever we leave the draft page, drop the pending slot. Save and
+        // Cancel already null this; this catches the nav-bar / browser-back
+        // discard path so a stale draft can't resurface on revisit.
+        if (isDraft) State.pendingNewModel = null;
     }
 
     render();

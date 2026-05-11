@@ -110,9 +110,9 @@ function renderSettingsPage(container) {
         exportBtn.textContent = 'Export';
         exportBtn.onclick = async () => {
             const data = {
-                version: 1,
+                version: 2,
                 workspace: JSON.parse(localStorage.getItem(LS_WORKSPACE_KEY) || '{}'),
-                gpus: JSON.parse(localStorage.getItem(LS_GPUS_KEY) || '{}'),
+                systems: JSON.parse(localStorage.getItem(LS_SYSTEMS_KEY) || '{}'),
                 models: JSON.parse(localStorage.getItem(LS_MODELS_KEY) || '{}'),
                 plan: JSON.parse(localStorage.getItem(LS_PLAN_KEY) || '{}')
             };
@@ -181,13 +181,13 @@ function renderSettingsPage(container) {
             fileInput.onchange = async () => {
                 const file = fileInput.files[0];
                 if (!file) return;
-                const ok = await confirmDialog('Import will replace your current workspace, GPUs, cached models, and plan data. Continue?');
+                const ok = await confirmDialog('Import will replace your current workspace, Systems, cached models, and plan data. Continue?');
                 if (!ok) return;
                 try {
                     const text = await file.text();
                     const data = JSON.parse(text);
                     if (data.workspace) localStorage.setItem(LS_WORKSPACE_KEY, JSON.stringify(data.workspace));
-                    if (data.gpus) localStorage.setItem(LS_GPUS_KEY, JSON.stringify(data.gpus));
+                    if (data.systems) localStorage.setItem(LS_SYSTEMS_KEY, JSON.stringify(data.systems));
                     if (data.models) localStorage.setItem(LS_MODELS_KEY, JSON.stringify(data.models));
                     if (data.plan) localStorage.setItem(LS_PLAN_KEY, JSON.stringify(data.plan));
                     status.textContent = 'Data imported.';
@@ -214,7 +214,7 @@ function renderSettingsPage(container) {
         const planHelp = document.createElement('p');
         planHelp.style.cssText = 'margin: 2px 0 4px; color: var(--text-muted); font-size: 0.8rem;';
         planHelp.textContent =
-            'Reset all per-model planning inputs (server instances, user ranges, distribution buckets) to their defaults. ' +
+            'Reset all planning inputs (planning horizon, per-model server instances, requests/sec ranges, distribution buckets) to their defaults. ' +
             'Your workspace models, GPU list, and cached model configs are not affected.';
         panel.appendChild(planHelp);
 
