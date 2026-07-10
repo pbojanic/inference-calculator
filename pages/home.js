@@ -311,14 +311,20 @@ function renderHomePage(container) {
                 // slash-less query keeps the plain full-text `search=` behavior.
                 const params = new URLSearchParams();
                 const slash = query.indexOf('/');
-                if (slash !== -1) {
+                const orgScoped = slash !== -1;
+                if (orgScoped) {
                     params.set('author', query.slice(0, slash));
                     const rest = query.slice(slash + 1).trim();
                     if (rest) params.set('search', rest);
                 } else {
                     params.set('search', query);
                 }
-                params.set('filter', 'text-generation');
+                // Only constrain to text-generation for broad full-text
+                // searches. When the user has named an org, show everything it
+                // publishes: many modern LLMs (e.g. Mistral-Small-3.2, tagged
+                // image-text-to-text) aren't tagged text-generation and would
+                // otherwise be silently hidden from an org-scoped search.
+                if (!orgScoped) params.set('filter', 'text-generation');
                 params.set('sort', 'downloads');
                 params.set('direction', '-1');
                 params.set('limit', '20');
