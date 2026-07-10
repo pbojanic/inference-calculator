@@ -304,7 +304,25 @@ function renderHomePage(container) {
             resultsDiv.style.display = 'none';
 
             try {
-                const url = `https://huggingface.co/api/models?search=${encodeURIComponent(query)}&filter=text-generation&sort=downloads&direction=-1&limit=20`;
+                // Build the query params from the input shape. An "owner/" or
+                // "owner/partial" query is scoped to that org via the HF
+                // `author=` filter (an exact namespace match), with any text
+                // after the slash narrowing within the org via `search=`. A
+                // slash-less query keeps the plain full-text `search=` behavior.
+                const params = new URLSearchParams();
+                const slash = query.indexOf('/');
+                if (slash !== -1) {
+                    params.set('author', query.slice(0, slash));
+                    const rest = query.slice(slash + 1).trim();
+                    if (rest) params.set('search', rest);
+                } else {
+                    params.set('search', query);
+                }
+                params.set('filter', 'text-generation');
+                params.set('sort', 'downloads');
+                params.set('direction', '-1');
+                params.set('limit', '20');
+                const url = `https://huggingface.co/api/models?${params.toString()}`;
                 const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
                 if (!resp.ok) throw new Error(`Search failed: ${resp.status}`);
                 const models = await resp.json();
